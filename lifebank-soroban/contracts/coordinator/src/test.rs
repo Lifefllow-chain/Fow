@@ -9,13 +9,15 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    vec, Address, Env, String, Vec,
+    vec, Address, Env, Map, String, Vec,
 };
 
 use super::{
     BloodRequest, BloodStatus, BloodUnit, CoordinatorContract, CoordinatorContractClient,
-    CoordinatorError, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
+    CoordinatorError, DisputeReason, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
 };
+
+use lifebank_interfaces::{BloodComponent, BloodType, Urgency};
 
 // ── Mock: Request contract ────────────────────────────────────────────────────
 
@@ -35,9 +37,21 @@ impl MockRequestContract {
     }
 
     pub fn seed_request(env: Env, id: u64, status: RequestStatus) {
-        env.storage()
-            .persistent()
-            .set(&ReqKey::Request(id), &BloodRequest { id, status });
+        let req = BloodRequest {
+            id,
+            hospital_id: Address::generate(&env),
+            blood_type: BloodType::OPositive,
+            component: BloodComponent::WholeBlood,
+            quantity_ml: 450,
+            urgency: Urgency::Routine,
+            created_timestamp: 0,
+            required_by_timestamp: u64::MAX,
+            status,
+            assigned_units: Vec::new(&env),
+            fulfilled_quantity_ml: 0,
+            reservation_id: None,
+        };
+        env.storage().persistent().set(&ReqKey::Request(id), &req);
     }
 
     pub fn get_request(env: Env, request_id: u64) -> BloodRequest {
@@ -88,7 +102,14 @@ impl MockInventoryContract {
             &InvKey::Unit(id),
             &BloodUnit {
                 id,
+                blood_type: BloodType::OPositive,
+                quantity_ml: 450,
+                bank_id: Address::generate(&env),
+                donor_id: None,
+                donation_timestamp: 0,
+                expiration_timestamp: u64::MAX,
                 status: BloodStatus::Available,
+                metadata: Map::new(&env),
             },
         );
         id
@@ -177,12 +198,23 @@ impl MockPaymentContract {
             .unwrap_or(0u64)
             + 1;
         env.storage().instance().set(&PayKey::Counter, &id);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
         env.storage().persistent().set(
             &PayKey::Payment(id),
             &Payment {
                 id,
                 request_id,
+                payer,
+                payee,
+                amount: 1_000,
                 status,
+                created_at: 0,
+                updated_at: 0,
+                dispute_reason_code: None,
+                dispute_case_id: None,
+                dispute_resolved: false,
+                token: None,
             },
         );
         id
@@ -220,12 +252,7 @@ impl MockPaymentContract {
             .set(&PayKey::Payment(payment_id), &p);
     }
 
-    pub fn record_dispute(
-        env: Env,
-        payment_id: u64,
-        _reason: super::payment_client::DisputeReason,
-        _case_id: String,
-    ) {
+    pub fn record_dispute(env: Env, payment_id: u64, _reason: DisputeReason, _case_id: String) {
         let mut p: Payment = env
             .storage()
             .persistent()

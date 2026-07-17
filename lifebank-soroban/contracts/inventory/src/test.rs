@@ -1414,7 +1414,7 @@ fn test_transition_disposed_to_compromised_fails() {
 
 #[test]
 fn test_transition_pure_all_valid_pairs_succeeds() {
-    use crate::types::is_valid_transition;
+    use crate::types::is_valid_blood_transition as is_valid_transition;
     use BloodStatus::*;
 
     let valid = [
@@ -1434,7 +1434,7 @@ fn test_transition_pure_all_valid_pairs_succeeds() {
 
     for (from, to) in valid.iter() {
         assert!(
-            is_valid_transition(from, to),
+            is_valid_transition(*from, *to),
             "Expected valid: {:?} -> {:?}",
             from,
             to
@@ -1444,7 +1444,7 @@ fn test_transition_pure_all_valid_pairs_succeeds() {
 
 #[test]
 fn test_transition_pure_all_invalid_pairs_fails() {
-    use crate::types::is_valid_transition;
+    use crate::types::is_valid_blood_transition as is_valid_transition;
     use BloodStatus::*;
 
     let all_statuses = [
@@ -1471,13 +1471,13 @@ fn test_transition_pure_all_invalid_pairs_fails() {
             let pair = (*from, *to);
             let expected_valid = valid_set.contains(&pair);
             assert_eq!(
-                is_valid_transition(from, to),
+                is_valid_transition(*from, *to),
                 expected_valid,
                 "Mismatch for {:?} -> {:?}: expected valid={}, got {}",
                 from,
                 to,
                 expected_valid,
-                is_valid_transition(from, to)
+                is_valid_transition(*from, *to)
             );
         }
     }

@@ -7,7 +7,10 @@ mod types;
 mod validation;
 
 use crate::error::ContractError;
-use crate::types::{is_valid_transition, BloodStatus, BloodType, BloodUnit, DataKey, Reservation};
+use crate::types::{
+    is_valid_blood_transition, validate_blood_unit, BloodStatus, BloodType, BloodUnit, DataKey,
+    Reservation,
+};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 #[contract]
@@ -186,7 +189,7 @@ impl InventoryContract {
         };
 
         // Validate the complete blood unit
-        blood_unit.validate(current_time)?;
+        validate_blood_unit(&blood_unit, current_time)?;
 
         // Store blood unit — only reaches here if the ID slot was empty.
         storage::set_blood_unit(&env, &blood_unit);
@@ -266,7 +269,7 @@ impl InventoryContract {
         // Validate the transition using the pure is_valid_transition function.
         // This covers terminal state checks (Delivered/Disposed cannot transition)
         // as well as all illegal backwards transitions.
-        if !is_valid_transition(&old_status, &new_status) {
+        if !is_valid_blood_transition(old_status, new_status) {
             // Emit an event with both statuses for debuggability before returning error
             events::emit_invalid_transition(&env, unit_id, old_status, new_status);
             return Err(ContractError::InvalidStatusTransition);
@@ -393,7 +396,7 @@ impl InventoryContract {
                 }
             }
 
-            if !is_valid_transition(&old_status, &new_status) {
+            if !is_valid_blood_transition(old_status, new_status) {
                 events::emit_invalid_transition(&env, unit_id, old_status, new_status);
                 return Err(ContractError::InvalidStatusTransition);
             }

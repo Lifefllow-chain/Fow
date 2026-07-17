@@ -18,129 +18,13 @@ mod test;
 pub use error::CoordinatorError;
 pub use types::{DataKey, ExcursionSummary, WorkflowRecord, WorkflowStatus};
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+// Re-export shared interface types so the test module can import them via `super::`.
+pub use lifebank_interfaces::{
+    BloodRequest, BloodStatus, BloodUnit, DisputeReason, Payment, PaymentStatus, RequestStatus,
+};
+use lifebank_interfaces::clients::{InventoryContractClient, PaymentContractClient, RequestContractClient};
 
-// ── Minimal interface types mirroring the domain contracts ────────────────────
-// These allow the coordinator to inspect cross-contract return values without
-// importing compiled WASMs. The domain contracts must keep these in sync.
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestStatus {
-    Pending,
-    Approved,
-    Fulfilled,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BloodRequest {
-    pub id: u64,
-    pub status: RequestStatus,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BloodStatus {
-    Available,
-    Reserved,
-    InTransit,
-    Delivered,
-    Expired,
-    Compromised,
-    Disposed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BloodUnit {
-    pub id: u64,
-    pub status: BloodStatus,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PaymentStatus {
-    Pending,
-    Locked,
-    Released,
-    Refunded,
-    Disputed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Payment {
-    pub id: u64,
-    pub request_id: u64,
-    pub status: PaymentStatus,
-}
-
-// ── Cross-contract client traits ──────────────────────────────────────────────
-
-mod request_client {
-    use super::BloodRequest;
-    use soroban_sdk::{contractclient, Address, Env};
-
-    #[contractclient(name = "RequestContractClient")]
-    pub trait RequestContractInterface {
-        fn get_request(env: Env, request_id: u64) -> BloodRequest;
-    }
-}
-
-mod inventory_client {
-    use super::{BloodStatus, BloodUnit};
-    use soroban_sdk::{contractclient, Address, Env, String};
-
-    #[contractclient(name = "InventoryContractClient")]
-    pub trait InventoryContractInterface {
-        fn get_blood_unit(env: Env, blood_unit_id: u64) -> BloodUnit;
-        fn update_status(
-            env: Env,
-            unit_id: u64,
-            new_status: BloodStatus,
-            authorized_by: Address,
-            reason: Option<String>,
-        ) -> BloodUnit;
-        fn mark_delivered(
-            env: Env,
-            unit_id: u64,
-            authorized_by: Address,
-            delivery_location: String,
-        ) -> BloodUnit;
-        fn get_admin(env: Env) -> Address;
-    }
-}
-
-mod payment_client {
-    use super::{Payment, PaymentStatus};
-    use soroban_sdk::{contractclient, contracttype, Env, String};
-
-    #[contracttype]
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum DisputeReason {
-        FailedDelivery,
-        TemperatureExcursion,
-        PaymentContested,
-        WrongItem,
-        DamagedGoods,
-        LateDelivery,
-        Other,
-    }
-
-    #[contractclient(name = "PaymentContractClient")]
-    pub trait PaymentContractInterface {
-        fn get_payment(env: Env, payment_id: u64) -> Payment;
-        fn update_status(env: Env, payment_id: u64, status: PaymentStatus);
-        fn record_dispute(env: Env, payment_id: u64, reason: DisputeReason, case_id: String);
-    }
-}
-
-use inventory_client::InventoryContractClient;
-use payment_client::PaymentContractClient;
-use request_client::RequestContractClient;
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
 
 const ALLOCATION_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
@@ -620,7 +504,7 @@ impl CoordinatorContract {
         pay_client
             .try_record_dispute(
                 &payment_id,
-                &payment_client::DisputeReason::TemperatureExcursion,
+                &DisputeReason::TemperatureExcursion,
                 &case_id,
             )
             .map_err(|_| CoordinatorError::PaymentFlagFailed)?

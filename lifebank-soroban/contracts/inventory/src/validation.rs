@@ -18,7 +18,7 @@ pub fn validate_status_transition(
     current_status: BloodStatus,
     new_status: BloodStatus,
 ) -> Result<(), ContractError> {
-    if !crate::types::is_valid_transition(&current_status, &new_status) {
+    if !crate::types::is_valid_blood_transition(current_status, new_status) {
         return Err(ContractError::InvalidStatusTransition);
     }
     Ok(())

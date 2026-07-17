@@ -5,48 +5,8 @@ use soroban_sdk::{
     Vec,
 };
 
-// ── Types ──────────────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaymentStatus {
-    Pending,
-    Locked,
-    Released,
-    Refunded,
-    Disputed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisputeReason {
-    FailedDelivery,
-    TemperatureExcursion,
-    PaymentContested,
-    WrongItem,
-    DamagedGoods,
-    LateDelivery,
-    Other,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Payment {
-    pub id: u64,
-    pub request_id: u64,
-    pub payer: Address,
-    pub payee: Address,
-    pub amount: i128,
-    pub status: PaymentStatus,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub dispute_reason_code: Option<u32>,
-    pub dispute_case_id: Option<String>,
-    pub dispute_resolved: bool,
-    /// Token contract address — set only for escrow-backed payments.
-    pub token: Option<Address>,
-}
+// Cross-contract types — single source of truth from the interfaces crate.
+pub use lifebank_interfaces::{DisputeReason, Payment, PaymentStatus};
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
     match reason {
