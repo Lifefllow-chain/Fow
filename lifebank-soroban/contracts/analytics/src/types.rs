@@ -63,3 +63,68 @@ pub enum DataKey {
     TotalPaymentsReleased,
     TotalVolume,
 }
+
+// ── Events (#53) ─────────────────────────────────────────────────────────────
+
+/// Which lifetime counter a `MetricRecordedEvent` reports on.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricKind {
+    Donation,
+    Request,
+    Delivery,
+}
+
+/// Emitted once, when the contract is initialized.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub initialized_at: u64,
+}
+
+/// Emitted when the reporting period configuration changes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportingPeriodChangedEvent {
+    pub old_period_type: PeriodType,
+    pub new_period_type: PeriodType,
+    pub new_duration_secs: u64,
+    pub changed_at: u64,
+}
+
+/// Emitted by `record_donation`/`record_request`/`record_delivery`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricRecordedEvent {
+    pub period_index: u64,
+    pub metric: MetricKind,
+    /// Lifetime total for this metric after this recording.
+    pub lifetime_total: u64,
+    pub recorded_at: u64,
+}
+
+/// Emitted by `record_payment_released`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentReleasedRecordedEvent {
+    pub period_index: u64,
+    pub amount: i128,
+    pub lifetime_count: u64,
+    pub lifetime_volume: i128,
+    pub recorded_at: u64,
+}
+
+/// Emitted by `upgrade`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradedEvent {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+}
+
+/// Emitted by `migrate`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigratedEvent {
+    pub new_schema_version: u32,
+}

@@ -600,3 +600,288 @@ mod circuit_breaker_tests {
         client.pause(&attacker);
     }
 }
+
+// ── Event coverage (#53) ─────────────────────────────────────────────────────
+//
+// One test per state-mutating entrypoint asserting the exact cataloged event
+// (see EVENTS.md), plus failure-branch tests proving rejected calls emit
+// nothing, plus a shared envelope-shape test. `match_request` additionally
+// needs minimal mock Inventory/Requests contracts to exercise its success path.
+#[cfg(test)]
+mod event_coverage {
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Events},
+        Address, Env, IntoVal, Map, Symbol, TryIntoVal, Val, Vec,
+    };
+
+    use crate::{
+        BloodRequest, BloodStatus, BloodType, BloodUnit, InitializedEvent, MatchComputedEvent,
+        MatchingContract, MatchingContractClient, MatchingError, MigratedEvent, PauseChangedEvent,
+        RequestStatus, UpgradedEvent, Urgency,
+    };
+
+    /// Assert the most recently published event matches the standard envelope
+    /// `(domain, event, schema_version)` plus the given payload.
+    fn assert_last_event(
+        env: &Env,
+        contract_id: &Address,
+        domain: &str,
+        event: &str,
+        version: u32,
+        data: impl IntoVal<Env, Val>,
+    ) {
+        let all = env.events().all();
+        assert!(!all.is_empty(), "no events were published");
+        let actual = all.get(all.len() - 1).unwrap();
+        let topics: Vec<Val> =
+            (Symbol::new(env, domain), Symbol::new(env, event), version).into_val(env);
+        assert_eq!(actual, (contract_id.clone(), topics, data.into_val(env)));
+    }
+
+    fn setup<'a>() -> (Env, MatchingContractClient<'a>, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MatchingContract, ());
+        let client = MatchingContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let inventory = Address::generate(&env);
+        let requests = Address::generate(&env);
+        client.initialize(&admin, &inventory, &requests);
+        (env, client, admin, inventory, requests)
+    }
+
+    #[test]
+    fn test_event_envelope_third_topic_is_u32_schema_version() {
+        let (env, _client, ..) = setup();
+        let all = env.events().all();
+        let (_, topics, _) = all.get(all.len() - 1).unwrap();
+        assert_eq!(topics.len(), 3, "envelope must be (domain, event, schema_version)");
+        let version: u32 = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MatchingContract, ());
+        let client = MatchingContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let inventory = Address::generate(&env);
+        let requests = Address::generate(&env);
+        client.initialize(&admin, &inventory, &requests);
+
+        assert_last_event(
+            &env,
+            &client.address,
+            "match",
+            "init",
+            1,
+            InitializedEvent {
+                admin,
+                inventory_contract: inventory,
+                requests_contract: requests,
+                initialized_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #600)")]
+    fn test_double_initialize_panics_before_emitting() {
+        let (_env, client, admin, inv, req) = setup();
+        // AlreadyInitialized panics (unwrapped client), so no second event.
+        client.initialize(&admin, &inv, &req);
+    }
+
+    #[test]
+    fn test_pause_emits_event() {
+        let (env, client, admin, ..) = setup();
+        client.pause(&admin);
+        assert_last_event(
+            &env,
+            &client.address,
+            "match",
+            "pause",
+            1,
+            PauseChangedEvent {
+                admin,
+                paused: true,
+                changed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_unpause_emits_event() {
+        let (env, client, admin, ..) = setup();
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert_last_event(
+            &env,
+            &client.address,
+            "match",
+            "pause",
+            1,
+            PauseChangedEvent {
+                admin,
+                paused: false,
+                changed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_match_request_before_init_emits_no_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MatchingContract, ());
+        let client = MatchingContractClient::new(&env, &contract_id);
+        let result = client.try_match_request(&1u64);
+        assert_eq!(result, Err(Ok(MatchingError::NotInitialized)));
+        assert!(env.events().all().is_empty());
+    }
+
+    #[test]
+    fn test_migrate_refused_at_current_schema_emits_no_event() {
+        let (env, client, ..) = setup();
+        let before = env.events().all().len();
+        let result = client.try_migrate();
+        assert_eq!(result, Err(Ok(MatchingError::MigrationAlreadyApplied)));
+        assert_eq!(env.events().all().len(), before, "refused migration must not emit");
+    }
+
+    #[test]
+    fn test_upgrade_fails_when_not_initialized_emits_no_event() {
+        let env = Env::default();
+        let contract_id = env.register(MatchingContract, ());
+        let client = MatchingContractClient::new(&env, &contract_id);
+        let hash = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+        let result = client.try_upgrade(&hash);
+        assert_eq!(result, Err(Ok(MatchingError::Unauthorized)));
+        assert!(env.events().all().is_empty());
+    }
+
+    // ── match_request success path: minimal mock domain contracts ────────────
+
+    #[contract]
+    struct MockRequestsContract;
+
+    #[contractimpl]
+    impl MockRequestsContract {
+        pub fn seed(env: Env, request: BloodRequest) {
+            env.storage().persistent().set(&request.id, &request);
+        }
+
+        pub fn get_request(env: Env, request_id: u64) -> BloodRequest {
+            env.storage().persistent().get(&request_id).unwrap()
+        }
+    }
+
+    #[contract]
+    struct MockInventoryContract;
+
+    #[contractimpl]
+    impl MockInventoryContract {
+        pub fn seed(env: Env, unit: BloodUnit) {
+            env.storage().persistent().set(&(1u32, unit.id), &unit);
+            let mut ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&(2u32, unit.blood_type as u32))
+                .unwrap_or(Vec::new(&env));
+            ids.push_back(unit.id);
+            env.storage()
+                .persistent()
+                .set(&(2u32, unit.blood_type as u32), &ids);
+        }
+
+        pub fn get_blood_unit(env: Env, blood_unit_id: u64) -> BloodUnit {
+            env.storage().persistent().get(&(1u32, blood_unit_id)).unwrap()
+        }
+
+        pub fn get_units_by_blood_type(env: Env, blood_type: BloodType) -> Vec<u64> {
+            env.storage()
+                .persistent()
+                .get(&(2u32, blood_type as u32))
+                .unwrap_or(Vec::new(&env))
+        }
+    }
+
+    #[test]
+    fn test_match_request_emits_event_with_matched_units() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let inv_id = env.register(MockInventoryContract, ());
+        let req_id = env.register(MockRequestsContract, ());
+        let inv_client = MockInventoryContractClient::new(&env, &inv_id);
+        let req_client = MockRequestsContractClient::new(&env, &req_id);
+
+        let hospital = Address::generate(&env);
+        let bank = Address::generate(&env);
+
+        let unit = BloodUnit {
+            id: 1,
+            blood_type: BloodType::OPositive,
+            quantity_ml: 500,
+            bank_id: bank,
+            donor_id: None,
+            donation_timestamp: 0,
+            expiration_timestamp: 1_000_000,
+            status: BloodStatus::Available,
+            metadata: Map::new(&env),
+        };
+        inv_client.seed(&unit);
+
+        let request = BloodRequest {
+            id: 42,
+            hospital_id: hospital,
+            blood_type: BloodType::OPositive,
+            component: crate::BloodComponent::WholeBlood,
+            quantity_ml: 300,
+            urgency: Urgency::Urgent,
+            created_timestamp: 0,
+            required_by_timestamp: 999_999,
+            status: RequestStatus::Pending,
+            assigned_units: Vec::new(&env),
+            fulfilled_quantity_ml: 0,
+        };
+        req_client.seed(&request);
+
+        let contract_id = env.register(MatchingContract, ());
+        let client = MatchingContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &inv_id, &req_id);
+
+        let result = client.match_request(&42u64);
+        assert_eq!(result.total_matched_ml, 300);
+        assert_eq!(result.remaining_ml, 0);
+        assert!(!result.partial_fulfillment);
+
+        assert_last_event(
+            &env,
+            &client.address,
+            "match",
+            "matched",
+            1,
+            MatchComputedEvent {
+                request_id: 42,
+                matched_unit_ids: soroban_sdk::vec![&env, 1u64],
+                total_matched_ml: 300,
+                remaining_ml: 0,
+                partial_fulfillment: false,
+                matched_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    // Reference the upgrade/migrate event types so they stay covered by
+    // the compiler even though their success path isn't independently
+    // testable without a real compiled WASM binary (see EVENTS.md).
+    #[allow(dead_code)]
+    fn _reference_upgrade_and_migrate_event_types(u: UpgradedEvent, m: MigratedEvent) {
+        let _ = (u, m);
+    }
+}

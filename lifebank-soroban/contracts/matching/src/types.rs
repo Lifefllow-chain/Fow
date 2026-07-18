@@ -167,3 +167,55 @@ pub enum DataKey {
     Initialized,
     Paused,
 }
+
+// ---------------------------------------------------------------------------
+// Events (#53)
+// ---------------------------------------------------------------------------
+
+/// Emitted once, when the contract is initialized.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub inventory_contract: Address,
+    pub requests_contract: Address,
+    pub initialized_at: u64,
+}
+
+/// Emitted by `pause`/`unpause`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PauseChangedEvent {
+    pub admin: Address,
+    pub paused: bool,
+    pub changed_at: u64,
+}
+
+/// Emitted by `match_request` (and transitively by `match_multiple_requests`,
+/// which calls it once per request) — the core business transition this
+/// contract exists to report.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchComputedEvent {
+    pub request_id: u64,
+    /// Inventory unit IDs selected to fulfil the request, in order.
+    pub matched_unit_ids: Vec<u64>,
+    pub total_matched_ml: u32,
+    pub remaining_ml: u32,
+    pub partial_fulfillment: bool,
+    pub matched_at: u64,
+}
+
+/// Emitted by `upgrade`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradedEvent {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+}
+
+/// Emitted by `migrate`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigratedEvent {
+    pub new_schema_version: u32,
+}

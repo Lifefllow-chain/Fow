@@ -1,6 +1,7 @@
 #![no_std]
 
 mod error;
+mod events;
 mod matching;
 mod types;
 
@@ -10,8 +11,9 @@ mod test;
 pub use error::MatchingError;
 pub use matching::{compatible_donor_types, is_compatible, score_unit, select_units, sort_by_expiration};
 pub use types::{
-    BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, DataKey, MatchKind,
-    MatchResult, MatchedUnit, RequestStatus, Urgency,
+    BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, DataKey, InitializedEvent,
+    MatchComputedEvent, MatchKind, MatchResult, MatchedUnit, MigratedEvent, PauseChangedEvent,
+    RequestStatus, UpgradedEvent, Urgency,
 };
 
 use soroban_sdk::{contract, contractclient, contractimpl, Address, Env, Vec};
@@ -65,6 +67,14 @@ impl MatchingContract {
             .set(&DataKey::RequestsContract, &requests_contract);
         env.storage().instance().set(&DataKey::Initialized, &true);
 
+        events::emit_initialized(
+            &env,
+            &admin,
+            &inventory_contract,
+            &requests_contract,
+            env.ledger().timestamp(),
+        );
+
         Ok(())
     }
 
@@ -80,6 +90,7 @@ impl MatchingContract {
             return Err(MatchingError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::emit_pause_changed(&env, &admin, true, env.ledger().timestamp());
         Ok(())
     }
 
@@ -95,6 +106,7 @@ impl MatchingContract {
             return Err(MatchingError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::emit_pause_changed(&env, &admin, false, env.ledger().timestamp());
         Ok(())
     }
 
@@ -202,6 +214,15 @@ impl MatchingContract {
         };
         let remaining_ml = request.quantity_ml.saturating_sub(total_matched_ml);
         let partial_fulfillment = total_matched_ml > 0 && remaining_ml > 0;
+
+        events::emit_match_computed(
+            &env,
+            request_id,
+            &matched,
+            total_matched_ml,
+            remaining_ml,
+            partial_fulfillment,
+        );
 
         Ok(MatchResult {
             request_id,
@@ -342,6 +363,7 @@ impl MatchingContract {
             .get(&DataKey::Admin)
             .ok_or(MatchingError::Unauthorized)?;
         admin.require_auth();
+        events::emit_upgraded(&env, &new_wasm_hash);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -365,6 +387,7 @@ impl MatchingContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        events::emit_migrated(&env, TARGET_SCHEMA_VERSION);
         Ok(TARGET_SCHEMA_VERSION)
     }
 }

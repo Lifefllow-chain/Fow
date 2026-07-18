@@ -1,7 +1,43 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Ledger as _, testutils::Address as _, testutils::Events as _, Env};
+use soroban_sdk::{
+    testutils::Ledger as _, testutils::Address as _, testutils::Events as _, Env, IntoVal,
+    Symbol, TryIntoVal, Val,
+};
+
+/// Assert the event `index_from_end` positions back from the most recent
+/// (0 = last) matches the standard envelope `(domain, event, schema_version)`
+/// plus the given payload.
+fn assert_event_at(
+    env: &Env,
+    index_from_end: u32,
+    contract_id: &Address,
+    domain: &str,
+    event: &str,
+    version: u32,
+    data: impl IntoVal<Env, Val>,
+) {
+    let all = env.events().all();
+    assert!(all.len() > index_from_end, "not enough events were published");
+    let actual = all.get(all.len() - 1 - index_from_end).unwrap();
+    let topics: soroban_sdk::Vec<Val> =
+        (Symbol::new(env, domain), Symbol::new(env, event), version).into_val(env);
+    assert_eq!(actual, (contract_id.clone(), topics, data.into_val(env)));
+}
+
+/// Assert the most recently published event matches the standard envelope
+/// `(domain, event, schema_version)` plus the given payload.
+fn assert_last_event(
+    env: &Env,
+    contract_id: &Address,
+    domain: &str,
+    event: &str,
+    version: u32,
+    data: impl IntoVal<Env, Val>,
+) {
+    assert_event_at(env, 0, contract_id, domain, event, version, data);
+}
 
 const DAY: u64 = 24 * 3600;
 const ENTITY: u64 = 1;
@@ -832,4 +868,360 @@ fn test_reputation_non_admin_cannot_pause() {
 
     let attacker = Address::generate(&env);
     c.pause(&attacker);
+}
+
+// ── Event coverage (#53) ──────────────────────────────────────────────────────
+//
+// One test per state-mutating entrypoint asserting the exact cataloged event
+// (see EVENTS.md), plus failure-branch tests proving rejected calls emit
+// nothing, plus a shared envelope-shape test.
+
+#[test]
+fn test_event_envelope_third_topic_is_u32_schema_version() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+
+    let all = env.events().all();
+    let (_, topics, _) = all.get(all.len() - 1).unwrap();
+    assert_eq!(topics.len(), 3, "envelope must be (domain, event, schema_version)");
+    let version: u32 = topics.get(2).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(version, 1);
+}
+
+#[test]
+fn test_initialize_emits_typed_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "init",
+        1,
+        InitializedEvent {
+            admin,
+            initialized_at: env.ledger().timestamp(),
+        },
+    );
+}
+
+#[test]
+fn test_pause_emits_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+
+    c.pause(&admin);
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "pause",
+        1,
+        PauseChangedEvent {
+            admin,
+            paused: true,
+            changed_at: env.ledger().timestamp(),
+        },
+    );
+}
+
+#[test]
+fn test_unpause_emits_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.pause(&admin);
+
+    c.unpause(&admin);
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "pause",
+        1,
+        PauseChangedEvent {
+            admin,
+            paused: false,
+            changed_at: env.ledger().timestamp(),
+        },
+    );
+}
+
+#[test]
+fn test_submit_rating_emits_rating_and_score_events() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let result = c.submit_rating(&ENTITY, &5, &1000);
+
+    assert_event_at(
+        &env,
+        1,
+        &cid,
+        "rep",
+        "rating",
+        1,
+        RatingSubmittedEvent {
+            entity_id: ENTITY,
+            score: 500,
+            timestamp: 1000,
+        },
+    );
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "updated",
+        1,
+        ScoreUpdatedEvent {
+            entity_id: ENTITY,
+            score: result.score,
+        },
+    );
+}
+
+#[test]
+fn test_submit_rating_invalid_score_emits_no_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    let before = env.events().all().len();
+
+    let result = c.try_submit_rating(&ENTITY, &9, &1000);
+    assert_eq!(result, Err(Ok(Error::InvalidRating)));
+    assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+}
+
+#[test]
+fn test_record_assignment_emits_assignment_and_score_events() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 2000);
+
+    let result = c.record_assignment(&ENTITY, &true, &120u64, &2000);
+
+    assert_event_at(
+        &env,
+        1,
+        &cid,
+        "rep",
+        "assign",
+        1,
+        AssignmentRecordedEvent {
+            entity_id: ENTITY,
+            completed: true,
+            response_secs: 120,
+            timestamp: 2000,
+        },
+    );
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "updated",
+        1,
+        ScoreUpdatedEvent {
+            entity_id: ENTITY,
+            score: result.score,
+        },
+    );
+}
+
+#[test]
+fn test_flag_fraud_emits_fraud_and_score_events() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.submit_rating(&ENTITY, &5, &1000);
+
+    env.ledger().with_mut(|l| l.timestamp = 3000);
+    let result = c.flag_fraud(&ENTITY, &3000);
+
+    assert_event_at(
+        &env,
+        1,
+        &cid,
+        "rep",
+        "fraud",
+        1,
+        FraudFlaggedEvent {
+            entity_id: ENTITY,
+            timestamp: 3000,
+        },
+    );
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "updated",
+        1,
+        ScoreUpdatedEvent {
+            entity_id: ENTITY,
+            score: result.score,
+        },
+    );
+}
+
+#[test]
+fn test_flag_fraud_entity_not_found_emits_no_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    let before = env.events().all().len();
+
+    let result = c.try_flag_fraud(&999u64, &1000);
+    assert_eq!(result, Err(Ok(Error::EntityNotFound)));
+    assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+}
+
+#[test]
+fn test_apply_penalty_emits_penalty_and_score_events() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.submit_rating(&ENTITY, &5, &1000);
+
+    env.ledger().with_mut(|l| l.timestamp = 4000);
+    let result = c.apply_penalty(&ENTITY, &ViolationType::Minor);
+
+    assert_event_at(
+        &env,
+        1,
+        &cid,
+        "rep",
+        "pen_new",
+        1,
+        PenaltyAppliedEvent {
+            entity_id: ENTITY,
+            penalty_id: 0,
+            violation_type: ViolationType::Minor,
+            timestamp: 4000,
+        },
+    );
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "updated",
+        1,
+        ScoreUpdatedEvent {
+            entity_id: ENTITY,
+            score: result.score,
+        },
+    );
+}
+
+#[test]
+fn test_appeal_penalty_emits_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.submit_rating(&ENTITY, &5, &1000);
+    c.apply_penalty(&ENTITY, &ViolationType::Minor);
+
+    c.appeal_penalty(&ENTITY, &0u32);
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "pen_apl",
+        1,
+        PenaltyAppealedEvent {
+            entity_id: ENTITY,
+            penalty_id: 0,
+        },
+    );
+}
+
+#[test]
+fn test_appeal_penalty_not_found_emits_no_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.submit_rating(&ENTITY, &5, &1000);
+    let before = env.events().all().len();
+
+    let result = c.try_appeal_penalty(&ENTITY, &999u32);
+    assert_eq!(result, Err(Ok(Error::PenaltyNotFound)));
+    assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+}
+
+#[test]
+fn test_resolve_penalty_emits_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    c.submit_rating(&ENTITY, &5, &1000);
+    c.apply_penalty(&ENTITY, &ViolationType::Minor);
+
+    let result = c.resolve_penalty(&ENTITY, &0u32, &false);
+    assert_event_at(
+        &env,
+        1,
+        &cid,
+        "rep",
+        "pen_res",
+        1,
+        PenaltyResolvedEvent {
+            entity_id: ENTITY,
+            penalty_id: 0,
+            removed: false,
+        },
+    );
+    assert_last_event(
+        &env,
+        &cid,
+        "rep",
+        "updated",
+        1,
+        ScoreUpdatedEvent {
+            entity_id: ENTITY,
+            score: result.score,
+        },
+    );
+}
+
+#[test]
+fn test_migrate_refused_at_current_schema_emits_no_event() {
+    let (env, cid) = setup();
+    let admin = Address::generate(&env);
+    let c = client(&env, &cid);
+    c.initialize(&admin);
+    let before = env.events().all().len();
+
+    let result = c.try_migrate();
+    assert_eq!(result, Err(Ok(Error::MigrationAlreadyApplied)));
+    assert_eq!(env.events().all().len(), before, "refused migration must not emit");
+}
+
+#[test]
+fn test_upgrade_fails_when_not_initialized_emits_no_event() {
+    let env = Env::default();
+    let cid = env.register(ReputationContract, ());
+    let c = client(&env, &cid);
+    let hash = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+
+    let result = c.try_upgrade(&hash);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(env.events().all().is_empty());
 }

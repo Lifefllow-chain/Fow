@@ -1,15 +1,20 @@
 #![no_std]
 
 mod error;
+mod events;
 mod types;
 
 #[cfg(test)]
 mod test;
 
 pub use error::AnalyticsError;
-pub use types::{AnalyticsConfig, DataKey, MetricsSnapshot, PeriodType, ReportingPeriod};
+pub use types::{
+    AnalyticsConfig, DataKey, InitializedEvent, MetricKind, MetricRecordedEvent, MetricsSnapshot,
+    MigratedEvent, PaymentReleasedRecordedEvent, PeriodType, ReportingPeriod,
+    ReportingPeriodChangedEvent, UpgradedEvent,
+};
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env};
+use soroban_sdk::{contract, contractimpl, Address, Env};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -121,14 +126,7 @@ impl AnalyticsContract {
             .set(&DataKey::TotalPaymentsReleased, &0u64);
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
 
-        env.events().publish(
-            (
-                symbol_short!("anlytcs"),
-                symbol_short!("init"),
-                symbol_short!("v1"),
-            ),
-            admin,
-        );
+        events::emit_initialized(&env, &admin, now);
 
         Ok(())
     }
@@ -138,6 +136,7 @@ impl AnalyticsContract {
     /// Update the reporting period. Admin only.
     pub fn set_reporting_period(env: Env, period_type: PeriodType) -> Result<(), AnalyticsError> {
         let mut cfg = require_admin(&env)?;
+        let old_period_type = cfg.reporting_period.period_type;
 
         let duration_secs = match period_type {
             PeriodType::Daily => DAILY_SECS,
@@ -145,13 +144,21 @@ impl AnalyticsContract {
             PeriodType::Monthly => MONTHLY_SECS,
         };
 
+        let changed_at = env.ledger().timestamp();
         cfg.reporting_period = ReportingPeriod {
             period_type,
             duration_secs,
-            configured_at: env.ledger().timestamp(),
+            configured_at: changed_at,
         };
 
         env.storage().instance().set(&DataKey::Config, &cfg);
+        events::emit_reporting_period_changed(
+            &env,
+            old_period_type,
+            period_type,
+            duration_secs,
+            changed_at,
+        );
         Ok(())
     }
 
@@ -170,6 +177,7 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalDonations, &total);
+        events::emit_metric_recorded(&env, idx, MetricKind::Donation, total, snap.last_updated);
         Ok(())
     }
 
@@ -186,6 +194,7 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalRequests, &total);
+        events::emit_metric_recorded(&env, idx, MetricKind::Request, total, snap.last_updated);
         Ok(())
     }
 
@@ -202,6 +211,7 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalDeliveries, &total);
+        events::emit_metric_recorded(&env, idx, MetricKind::Delivery, total, snap.last_updated);
         Ok(())
     }
 
@@ -224,6 +234,14 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalVolume, &total_volume);
+        events::emit_payment_released_recorded(
+            &env,
+            idx,
+            amount,
+            total_payments,
+            total_volume,
+            snap.last_updated,
+        );
         Ok(())
     }
 
@@ -289,6 +307,7 @@ impl AnalyticsContract {
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), AnalyticsError> {
         let admin = require_initialized(&env)?.admin;
         admin.require_auth();
+        events::emit_upgraded(&env, &new_wasm_hash);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -308,6 +327,7 @@ impl AnalyticsContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        events::emit_migrated(&env, TARGET_SCHEMA_VERSION);
         Ok(TARGET_SCHEMA_VERSION)
     }
 }

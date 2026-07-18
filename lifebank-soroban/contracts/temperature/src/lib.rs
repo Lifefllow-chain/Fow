@@ -1,6 +1,7 @@
 #![no_std]
 
 mod error;
+mod events;
 mod storage;
 mod types;
 
@@ -34,6 +35,7 @@ impl TemperatureContract {
         }
 
         storage::set_admin(&env, &admin);
+        events::emit_initialized(&env, &admin, env.ledger().timestamp());
         Ok(())
     }
 
@@ -45,6 +47,7 @@ impl TemperatureContract {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::emit_pause_changed(&env, &admin, true, env.ledger().timestamp());
         Ok(())
     }
 
@@ -56,6 +59,7 @@ impl TemperatureContract {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::emit_pause_changed(&env, &admin, false, env.ledger().timestamp());
         Ok(())
     }
 
@@ -103,6 +107,13 @@ impl TemperatureContract {
             max_celsius_x100,
         };
         storage::set_threshold(&env, unit_id, &threshold);
+        events::emit_threshold_set(
+            &env,
+            unit_id,
+            min_celsius_x100,
+            max_celsius_x100,
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 
@@ -174,6 +185,21 @@ impl TemperatureContract {
 
         storage::set_temp_page(&env, unit_id, page_num, &page);
         storage::set_temp_page_len(&env, unit_id, page_num, position.saturating_add(1)); // Prevent overflow
+
+        let compromised: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IsCompromised(unit_id))
+            .unwrap_or(false);
+        events::emit_reading_logged(
+            &env,
+            unit_id,
+            temperature_celsius_x100,
+            timestamp,
+            is_violation,
+            new_streak,
+            compromised,
+        );
 
         Ok(())
     }
@@ -353,6 +379,8 @@ impl TemperatureContract {
         env.storage().persistent().set(&streak_key, &0u32);
         env.storage().persistent().set(&compromised_key, &false);
 
+        events::emit_compromised_status_reset(&env, unit_id, env.ledger().timestamp());
+
         Ok(())
     }
 
@@ -372,6 +400,7 @@ impl TemperatureContract {
         env.storage()
             .instance()
             .set(&DataKey::CoordinatorContract, &coordinator);
+        events::emit_coordinator_set(&env, &coordinator, env.ledger().timestamp());
         Ok(())
     }
 
@@ -388,7 +417,8 @@ impl TemperatureContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::OracleWhitelist(oracle), &true);
+            .set(&DataKey::OracleWhitelist(oracle.clone()), &true);
+        events::emit_oracle_added(&env, &oracle, env.ledger().timestamp());
         Ok(())
     }
 
@@ -442,9 +472,14 @@ impl TemperatureContract {
             .map_err(|_| ContractError::CoordinatorCallFailed)?
             .map_err(|_| ContractError::CoordinatorCallFailed)?;
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("tmp_excur"),),
-            (unit_id, payment_id, excursion_summary.violation_count),
+        events::emit_excursion_reported(
+            &env,
+            unit_id,
+            payment_id,
+            excursion_summary.violation_count,
+            excursion_summary.peak_celsius_x100,
+            excursion_summary.detected_at,
+            &caller,
         );
 
         Ok(())
@@ -475,6 +510,7 @@ impl TemperatureContract {
             .get(&crate::types::DataKey::Admin)
             .ok_or(ContractError::Unauthorized)?;
         admin.require_auth();
+        events::emit_upgraded(&env, &new_wasm_hash);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -498,6 +534,7 @@ impl TemperatureContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        events::emit_migrated(&env, TARGET_SCHEMA_VERSION);
         Ok(TARGET_SCHEMA_VERSION)
     }
 }
@@ -505,7 +542,41 @@ impl TemperatureContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{IntoVal, Symbol, TryIntoVal, Val};
+
+    /// Assert the event `index_from_end` positions back from the most recent
+    /// (0 = last) matches the standard envelope `(domain, event,
+    /// schema_version)` plus the given payload.
+    fn assert_event_at(
+        env: &Env,
+        index_from_end: u32,
+        contract_id: &Address,
+        domain: &str,
+        event: &str,
+        version: u32,
+        data: impl IntoVal<Env, Val>,
+    ) {
+        let all = env.events().all();
+        assert!(all.len() > index_from_end, "not enough events were published");
+        let actual = all.get(all.len() - 1 - index_from_end).unwrap();
+        let topics: Vec<Val> =
+            (Symbol::new(env, domain), Symbol::new(env, event), version).into_val(env);
+        assert_eq!(actual, (contract_id.clone(), topics, data.into_val(env)));
+    }
+
+    /// Assert the most recently published event matches the standard
+    /// envelope `(domain, event, schema_version)` plus the given payload.
+    fn assert_last_event(
+        env: &Env,
+        contract_id: &Address,
+        domain: &str,
+        event: &str,
+        version: u32,
+        data: impl IntoVal<Env, Val>,
+    ) {
+        assert_event_at(env, 0, contract_id, domain, event, version, data);
+    }
 
     fn create_test_contract<'a>() -> (Env, Address, TemperatureContractClient<'a>) {
         let env = Env::default();
@@ -1061,6 +1132,291 @@ mod tests {
         let (env, _admin, client) = create_test_contract();
         let attacker = Address::generate(&env);
         client.pause(&attacker);
+    }
+
+    // ── Event coverage (#53) ─────────────────────────────────────────────────
+    //
+    // One test per state-mutating entrypoint asserting the exact cataloged
+    // event (see EVENTS.md), plus failure-branch tests proving rejected
+    // calls emit nothing, plus a shared envelope-shape test.
+
+    #[test]
+    fn test_event_envelope_third_topic_is_u32_schema_version() {
+        let (env, _admin, _client) = create_test_contract();
+        let all = env.events().all();
+        let (_, topics, _) = all.get(all.len() - 1).unwrap();
+        assert_eq!(topics.len(), 3, "envelope must be (domain, event, schema_version)");
+        let version: u32 = topics.get(2).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(TemperatureContract, ());
+        let client = TemperatureContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "init",
+            1,
+            InitializedEvent {
+                admin,
+                initialized_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_pause_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        client.pause(&admin);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "pause",
+            1,
+            PauseChangedEvent {
+                admin,
+                paused: true,
+                changed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_unpause_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "pause",
+            1,
+            PauseChangedEvent {
+                admin,
+                paused: false,
+                changed_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_threshold_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        let unit_id = 7u64;
+        client.set_threshold(&admin, &unit_id, &200, &600);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "thresh",
+            1,
+            ThresholdSetEvent {
+                unit_id,
+                min_celsius_x100: 200,
+                max_celsius_x100: 600,
+                set_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_threshold_invalid_range_emits_no_event() {
+        let (env, admin, client) = create_test_contract();
+        let before = env.events().all().len();
+        let result = client.try_set_threshold(&admin, &7u64, &600, &200);
+        assert_eq!(result, Err(Ok(ContractError::InvalidThreshold)));
+        assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+    }
+
+    #[test]
+    fn test_log_reading_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        let unit_id = 8u64;
+        client.set_threshold(&admin, &unit_id, &200, &600);
+
+        client.log_reading(&unit_id, &700, &1000u64);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "reading",
+            1,
+            ReadingLoggedEvent {
+                unit_id,
+                temperature_celsius_x100: 700,
+                timestamp: 1000,
+                is_violation: true,
+                consecutive_streak: 1,
+                compromised: false,
+            },
+        );
+    }
+
+    #[test]
+    fn test_log_reading_without_threshold_emits_no_event() {
+        let (env, _admin, client) = create_test_contract();
+        let before = env.events().all().len();
+        let result = client.try_log_reading(&999u64, &400, &1000u64);
+        assert_eq!(result, Err(Ok(ContractError::ThresholdNotFound)));
+        assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+    }
+
+    #[test]
+    fn test_reset_compromised_status_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        let unit_id = 9u64;
+        client.set_threshold(&admin, &unit_id, &200, &600);
+        client.log_reading(&unit_id, &700, &1000u64);
+        client.log_reading(&unit_id, &700, &1001u64);
+        client.log_reading(&unit_id, &700, &1002u64);
+        assert!(client.is_compromised(&unit_id));
+
+        client.reset_compromised_status(&admin, &unit_id);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "cmp_rst",
+            1,
+            CompromisedStatusResetEvent {
+                unit_id,
+                reset_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_coordinator_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        let coordinator = Address::generate(&env);
+        client.set_coordinator(&admin, &coordinator);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "coord",
+            1,
+            CoordinatorSetEvent {
+                coordinator,
+                set_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_add_oracle_emits_event() {
+        let (env, admin, client) = create_test_contract();
+        let oracle = Address::generate(&env);
+        client.add_oracle(&admin, &oracle);
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "oracle",
+            1,
+            OracleAddedEvent {
+                oracle,
+                added_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_report_excursion_unauthorized_emits_no_event() {
+        let (env, _admin, client) = create_test_contract();
+        let attacker = Address::generate(&env);
+        let before = env.events().all().len();
+
+        let summary = ExcursionSummary {
+            unit_id: 1,
+            violation_count: 3,
+            peak_celsius_x100: 900,
+            detected_at: 1000,
+        };
+        let result =
+            client.try_report_excursion_to_coordinator(&attacker, &1u64, &1u64, &summary);
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+        assert_eq!(env.events().all().len(), before, "rejected call must not emit");
+    }
+
+    #[test]
+    fn test_migrate_refused_at_current_schema_emits_no_event() {
+        let (env, _admin, client) = create_test_contract();
+        let before = env.events().all().len();
+        let result = client.try_migrate();
+        assert_eq!(result, Err(Ok(ContractError::MigrationAlreadyApplied)));
+        assert_eq!(env.events().all().len(), before, "refused migration must not emit");
+    }
+
+    #[test]
+    fn test_upgrade_fails_when_not_initialized_emits_no_event() {
+        let env = Env::default();
+        let contract_id = env.register(TemperatureContract, ());
+        let client = TemperatureContractClient::new(&env, &contract_id);
+        let hash = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+        let result = client.try_upgrade(&hash);
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+        assert!(env.events().all().is_empty());
+    }
+
+    // ── report_excursion_to_coordinator success path: minimal mock ──────────
+
+    #[soroban_sdk::contract]
+    struct MockCoordinatorContract;
+
+    #[soroban_sdk::contractimpl]
+    impl MockCoordinatorContract {
+        pub fn flag_temperature_breach(
+            _env: Env,
+            _caller: Address,
+            _payment_id: u64,
+            _excursion_summary: ExcursionSummary,
+        ) -> Result<(), ContractError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_report_excursion_to_coordinator_emits_event() {
+        let (env, admin, client) = create_test_contract();
+
+        let coordinator_id = env.register(MockCoordinatorContract, ());
+        client.set_coordinator(&admin, &coordinator_id);
+
+        let summary = ExcursionSummary {
+            unit_id: 42,
+            violation_count: 3,
+            peak_celsius_x100: 900,
+            detected_at: 1000,
+        };
+        client.report_excursion_to_coordinator(&admin, &42u64, &7u64, &summary);
+
+        assert_last_event(
+            &env,
+            &client.address,
+            "temp",
+            "excursion",
+            1,
+            ExcursionReportedEvent {
+                unit_id: 42,
+                payment_id: 7,
+                violation_count: 3,
+                peak_celsius_x100: 900,
+                detected_at: 1000,
+                reported_by: admin,
+            },
+        );
     }
 }
 

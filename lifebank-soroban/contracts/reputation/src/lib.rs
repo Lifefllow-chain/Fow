@@ -1,7 +1,7 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+
+mod events;
 
 // ── Constants (all arithmetic is integer, scaled ×100 for two decimal places) ──
 
@@ -174,6 +174,103 @@ pub enum DataKey {
     Paused,
 }
 
+// ── Events (#53) ─────────────────────────────────────────────────────────────
+
+/// Emitted once, when the contract is initialized.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub initialized_at: u64,
+}
+
+/// Emitted by `pause`/`unpause`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PauseChangedEvent {
+    pub admin: Address,
+    pub paused: bool,
+    pub changed_at: u64,
+}
+
+/// Emitted by `submit_rating`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RatingSubmittedEvent {
+    pub entity_id: u64,
+    /// Raw score ×100 (e.g. 500 = 5 stars).
+    pub score: i64,
+    pub timestamp: u64,
+}
+
+/// Emitted by `record_assignment`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssignmentRecordedEvent {
+    pub entity_id: u64,
+    pub completed: bool,
+    pub response_secs: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted by `flag_fraud`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FraudFlaggedEvent {
+    pub entity_id: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted by `apply_penalty`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PenaltyAppliedEvent {
+    pub entity_id: u64,
+    pub penalty_id: u32,
+    pub violation_type: ViolationType,
+    pub timestamp: u64,
+}
+
+/// Emitted by `appeal_penalty`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PenaltyAppealedEvent {
+    pub entity_id: u64,
+    pub penalty_id: u32,
+}
+
+/// Emitted by `resolve_penalty`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PenaltyResolvedEvent {
+    pub entity_id: u64,
+    pub penalty_id: u32,
+    /// True if the penalty was removed outright; false if marked resolved.
+    pub removed: bool,
+}
+
+/// Emitted by `calculate_reputation` whenever a score is (re)computed.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoreUpdatedEvent {
+    pub entity_id: u64,
+    pub score: i64,
+}
+
+/// Emitted by `upgrade`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradedEvent {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+}
+
+/// Emitted by `migrate`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigratedEvent {
+    pub new_schema_version: u32,
+}
+
 // ── Contract ───────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -217,8 +314,7 @@ impl ReputationContract {
             },
         );
 
-        env.events()
-            .publish((symbol_short!("init"), symbol_short!("v1")), admin);
+        events::emit_initialized(&env, &admin, env.ledger().timestamp());
 
         Ok(())
     }
@@ -235,6 +331,7 @@ impl ReputationContract {
             return Err(Error::NotAuthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::emit_pause_changed(&env, &admin, true, env.ledger().timestamp());
         Ok(())
     }
 
@@ -250,6 +347,7 @@ impl ReputationContract {
             return Err(Error::NotAuthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::emit_pause_changed(&env, &admin, false, env.ledger().timestamp());
         Ok(())
     }
 
@@ -368,6 +466,8 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
 
+        events::emit_rating_submitted(&env, entity_id, score * 100, timestamp);
+
         let result = Self::calculate_reputation(env.clone(), entity_id)?;
         Ok(result)
     }
@@ -408,6 +508,8 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
 
+        events::emit_assignment_recorded(&env, entity_id, completed, response_secs, timestamp);
+
         Self::calculate_reputation(env, entity_id)
     }
 
@@ -425,6 +527,8 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
+
+        events::emit_fraud_flagged(&env, entity_id, timestamp);
 
         Self::calculate_reputation(env, entity_id)
     }
@@ -450,10 +554,11 @@ impl ReputationContract {
             .ok_or(Error::EntityNotFound)?;
 
         let id = input.penalties.len();
+        let applied_at = env.ledger().timestamp();
         input.penalties.push_back(PenaltyRecord {
             id,
             violation_type: violation,
-            timestamp: env.ledger().timestamp(),
+            timestamp: applied_at,
             is_resolved: false,
             is_appealed: false,
         });
@@ -461,6 +566,8 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
+
+        events::emit_penalty_applied(&env, entity_id, id, violation, applied_at);
 
         Self::calculate_reputation(env, entity_id)
     }
@@ -492,6 +599,7 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
+        events::emit_penalty_appealed(&env, entity_id, penalty_id);
         Ok(())
     }
 
@@ -536,6 +644,7 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Input(entity_id), &input);
+        events::emit_penalty_resolved(&env, entity_id, penalty_id, should_remove);
         Self::calculate_reputation(env, entity_id)
     }
 
@@ -612,14 +721,7 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::Score(entity_id), &result);
 
-        env.events().publish(
-            (
-                symbol_short!("rep"),
-                symbol_short!("updated"),
-                symbol_short!("v1"),
-            ),
-            (entity_id, final_score),
-        );
+        events::emit_score_updated(&env, entity_id, final_score);
 
         Ok(result)
     }
@@ -825,6 +927,7 @@ impl ReputationContract {
             .get(&DataKey::Admin)
             .ok_or(Error::NotAuthorized)?;
         admin.require_auth();
+        events::emit_upgraded(&env, &new_wasm_hash);
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
@@ -848,6 +951,7 @@ impl ReputationContract {
         env.storage()
             .instance()
             .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        events::emit_migrated(&env, TARGET_SCHEMA_VERSION);
         Ok(TARGET_SCHEMA_VERSION)
     }
 }
