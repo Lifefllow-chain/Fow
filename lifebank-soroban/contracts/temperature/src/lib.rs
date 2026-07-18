@@ -5,10 +5,32 @@ mod storage;
 mod types;
 
 use crate::error::ContractError;
-use crate::types::{DataKey, ExcursionSummary, TemperatureReading, TemperatureSummary, TemperatureThreshold};
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env, Vec};
+use crate::types::{
+    BatchOutcome, DataKey, DeviceInfo, ExcursionSummary, ProductThreshold, RawReading,
+    ShipmentEvidence, TemperatureReading, TemperatureSummary, TemperatureThreshold,
+};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Vec,
+};
 
 const PAGE_SIZE: u32 = 20;
+
+// ── Oracle authentication (#41) ───────────────────────────────────────────────
+
+/// How far a reading's timestamp may sit ahead of current ledger time before
+/// it's rejected as implausible clock skew.
+const MAX_FUTURE_SKEW_SECONDS: u64 = 300;
+/// How far a reading's timestamp may predate the shipment's start before
+/// it's rejected as outside the shipment window.
+const MAX_PAST_SKEW_SECONDS: u64 = 86_400;
+/// Physically impossible cold-chain bounds (±80.00°C), distinct from and far
+/// wider than any product's business threshold — these catch corrupted or
+/// spoofed sensor values, not ordinary excursions.
+const PLAUSIBLE_MIN_CELSIUS_X100: i32 = -8_000;
+const PLAUSIBLE_MAX_CELSIUS_X100: i32 = 8_000;
+/// Number of implausible batches after which a device is quarantined.
+const IMPLAUSIBLE_QUARANTINE_THRESHOLD: u32 = 3;
 
 #[contract]
 pub struct TemperatureContract;
@@ -450,6 +472,378 @@ impl TemperatureContract {
         Ok(())
     }
 
+    // ── Oracle authentication (#41) ───────────────────────────────────────────
+    //
+    // Registered devices submit signed batches scoped to one shipment (blood
+    // unit). Two independent layers of authorization gate every batch:
+    //   1. `submitter.require_auth()` — the gateway/backend relaying the
+    //      batch must hold the Stellar signing key registered for the device.
+    //   2. `ed25519_verify` — the physical device must have signed the exact
+    //      batch content, so a compromised gateway key alone can't forge
+    //      readings for a device it doesn't hold the private key for.
+    //
+    // A batch's readings are only folded into the shipment's breach verdict
+    // once both layers pass and the content clears the sanity checks below;
+    // every batch — accepted or not — is committed to the shipment's evidence
+    // hash chain so the on-chain record is a complete, tamper-evident log an
+    // arbiter can replay off-chain raw data against.
+
+    /// Register a device's on-chain identity: its authorized submitter
+    /// address, its Ed25519 public key, and the shipment (blood unit) it may
+    /// report readings for. Admin only.
+    pub fn register_device(
+        env: Env,
+        admin: Address,
+        device_id: u64,
+        submitter: Address,
+        pubkey: BytesN<32>,
+        unit_id: u64,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if storage::get_device(&env, device_id).is_some() {
+            return Err(ContractError::DeviceAlreadyRegistered);
+        }
+
+        storage::set_device(
+            &env,
+            device_id,
+            &DeviceInfo {
+                submitter,
+                pubkey,
+                shipment_id: unit_id,
+                last_seq: 0,
+                implausible_count: 0,
+                quarantined: false,
+            },
+        );
+
+        env.events()
+            .publish((symbol_short!("dev_reg"),), (device_id, unit_id));
+
+        Ok(())
+    }
+
+    /// Fetch a registered device's on-chain identity.
+    pub fn get_device(env: Env, device_id: u64) -> Result<DeviceInfo, ContractError> {
+        storage::get_device(&env, device_id).ok_or(ContractError::DeviceNotRegistered)
+    }
+
+    /// Publish a new versioned temperature threshold configuration for a
+    /// product (e.g. whole blood / platelets / plasma). Admin only. Returns
+    /// the new version number; existing shipments keep the version they were
+    /// pinned to at `start_shipment`, so this never retroactively changes a
+    /// shipment already in flight.
+    pub fn set_product_threshold(
+        env: Env,
+        admin: Address,
+        product_id: u64,
+        min_celsius_x100: i32,
+        max_celsius_x100: i32,
+    ) -> Result<u32, ContractError> {
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if min_celsius_x100 >= max_celsius_x100 {
+            return Err(ContractError::InvalidThreshold);
+        }
+
+        let version = storage::get_product_threshold_version(&env, product_id)
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        storage::set_product_threshold(
+            &env,
+            product_id,
+            version,
+            &ProductThreshold {
+                min_celsius_x100,
+                max_celsius_x100,
+                version,
+            },
+        );
+        storage::set_product_threshold_version(&env, product_id, version);
+
+        env.events()
+            .publish((symbol_short!("thr_ver"),), (product_id, version));
+
+        Ok(version)
+    }
+
+    /// Start a shipment (blood unit) for oracle-authenticated tracking,
+    /// pinning the product's *current* threshold version so later calls to
+    /// `set_product_threshold` cannot retroactively change this shipment's
+    /// verdict. Admin only.
+    pub fn start_shipment(
+        env: Env,
+        admin: Address,
+        unit_id: u64,
+        product_id: u64,
+    ) -> Result<u32, ContractError> {
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if storage::get_shipment_threshold_version(&env, unit_id).is_some() {
+            return Err(ContractError::ShipmentAlreadyStarted);
+        }
+
+        let version = storage::get_product_threshold_version(&env, product_id)
+            .ok_or(ContractError::ProductThresholdNotFound)?;
+
+        storage::set_shipment_threshold_version(&env, unit_id, version);
+        storage::set_shipment_product(&env, unit_id, product_id);
+        storage::set_shipment_started_at(&env, unit_id, env.ledger().timestamp());
+
+        env.events()
+            .publish((symbol_short!("ship_st"),), (unit_id, product_id, version));
+
+        Ok(version)
+    }
+
+    /// Recompute the sha256 commitment over a batch's declared content,
+    /// mirroring what a registered device signs offline: `device_id ||
+    /// seq_start || seq_end || (temperature || timestamp)*`.
+    fn hash_batch_payload(
+        env: &Env,
+        device_id: u64,
+        seq_start: u64,
+        seq_end: u64,
+        readings: &Vec<RawReading>,
+    ) -> BytesN<32> {
+        let mut data = Bytes::new(env);
+        data.append(&Bytes::from_array(env, &device_id.to_be_bytes()));
+        data.append(&Bytes::from_array(env, &seq_start.to_be_bytes()));
+        data.append(&Bytes::from_array(env, &seq_end.to_be_bytes()));
+        for reading in readings.iter() {
+            data.append(&Bytes::from_array(
+                env,
+                &reading.temperature_celsius_x100.to_be_bytes(),
+            ));
+            data.append(&Bytes::from_array(env, &reading.timestamp.to_be_bytes()));
+        }
+        env.crypto().sha256(&data).into()
+    }
+
+    /// Ingest an Ed25519-signed batch of offline-buffered readings from a
+    /// registered device.
+    ///
+    /// # Arguments
+    /// * `submitter`     - The gateway/backend relaying this batch; must
+    ///   match the device's registered submitter and authorize this call.
+    /// * `device_id`     - Registered device identity.
+    /// * `seq_start`/`seq_end` - Inclusive sequence range covered by `readings`;
+    ///   must be strictly greater than the device's last accepted sequence,
+    ///   rejecting replayed or reordered batches.
+    /// * `readings`      - Raw readings covering `seq_start..=seq_end`.
+    /// * `readings_hash` - sha256 commitment over the batch, as signed by the
+    ///   device; the contract independently recomputes and checks it so a
+    ///   relayer cannot pair a valid signature with substituted data.
+    /// * `signature`     - Ed25519 signature by the device over
+    ///   `device_id || seq_start || seq_end || readings_hash`.
+    ///
+    /// Every batch is committed to the shipment's evidence hash chain
+    /// regardless of outcome. Only a batch whose readings are all within the
+    /// ledger-time sanity window and physically plausible bounds is folded
+    /// into the shipment's breach verdict; devices are quarantined after
+    /// repeated implausible batches.
+    ///
+    /// # Errors
+    /// - `EmptyBatch`/`InvalidSequenceRange` - Malformed batch bounds
+    /// - `DeviceNotRegistered`   - No device under `device_id`
+    /// - `DeviceQuarantined`     - Device was quarantined by a prior batch
+    /// - `SubmitterMismatch`     - `submitter` isn't this device's registered submitter
+    /// - `InvalidSequence`       - `seq_start` reuses or reorders a prior sequence
+    /// - `ShipmentNotStarted`    - The device's shipment has no pinned threshold version
+    /// - `ProductThresholdNotFound` - Pinned threshold version no longer resolvable
+    /// - `ReadingsHashMismatch`  - Recomputed hash doesn't match `readings_hash`
+    ///
+    /// Panics (via the host's Ed25519 verifier) if `signature` doesn't match
+    /// `readings_hash` under the device's registered public key.
+    pub fn submit_reading_batch(
+        env: Env,
+        submitter: Address,
+        device_id: u64,
+        seq_start: u64,
+        seq_end: u64,
+        readings: Vec<RawReading>,
+        readings_hash: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<BatchOutcome, ContractError> {
+        submitter.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if readings.is_empty() {
+            return Err(ContractError::EmptyBatch);
+        }
+        let range_len = seq_end
+            .checked_sub(seq_start)
+            .and_then(|d| d.checked_add(1))
+            .ok_or(ContractError::InvalidSequenceRange)?;
+        if range_len != readings.len() as u64 {
+            return Err(ContractError::InvalidSequenceRange);
+        }
+
+        let mut device = storage::get_device(&env, device_id).ok_or(ContractError::DeviceNotRegistered)?;
+        if device.quarantined {
+            return Err(ContractError::DeviceQuarantined);
+        }
+        if device.submitter != submitter {
+            return Err(ContractError::SubmitterMismatch);
+        }
+        if seq_start <= device.last_seq {
+            return Err(ContractError::InvalidSequence);
+        }
+
+        let unit_id = device.shipment_id;
+        let threshold_version = storage::get_shipment_threshold_version(&env, unit_id)
+            .ok_or(ContractError::ShipmentNotStarted)?;
+        let product_id =
+            storage::get_shipment_product(&env, unit_id).ok_or(ContractError::ShipmentNotStarted)?;
+        let threshold = storage::get_product_threshold(&env, product_id, threshold_version)
+            .ok_or(ContractError::ProductThresholdNotFound)?;
+
+        let payload_hash = Self::hash_batch_payload(&env, device_id, seq_start, seq_end, &readings);
+        if payload_hash != readings_hash {
+            return Err(ContractError::ReadingsHashMismatch);
+        }
+
+        let mut message = Bytes::new(&env);
+        message.append(&Bytes::from_array(&env, &device_id.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &seq_start.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &seq_end.to_be_bytes()));
+        message.append(&Bytes::from_array(&env, &readings_hash.to_array()));
+        env.crypto()
+            .ed25519_verify(&device.pubkey, &message, &signature);
+
+        // ── Commit to the evidence chain unconditionally ──────────────────
+        let mut evidence = storage::get_shipment_evidence(&env, unit_id).unwrap_or(ShipmentEvidence {
+            product_id,
+            threshold_version,
+            chain_hash: BytesN::from_array(&env, &[0u8; 32]),
+            batch_count: 0,
+        });
+        let mut chain_input = Bytes::new(&env);
+        chain_input.append(&Bytes::from_array(&env, &evidence.chain_hash.to_array()));
+        chain_input.append(&Bytes::from_array(&env, &payload_hash.to_array()));
+        evidence.chain_hash = env.crypto().sha256(&chain_input).into();
+        evidence.batch_count = evidence.batch_count.saturating_add(1);
+        storage::set_shipment_evidence(&env, unit_id, &evidence);
+
+        device.last_seq = seq_end;
+
+        // ── Reading integrity checks ───────────────────────────────────────
+        let now = env.ledger().timestamp();
+        let shipment_started_at = storage::get_shipment_started_at(&env, unit_id).unwrap_or(now);
+
+        let mut timestamp_ok = true;
+        let mut plausible_ok = true;
+        for reading in readings.iter() {
+            if reading.timestamp > now.saturating_add(MAX_FUTURE_SKEW_SECONDS)
+                || reading.timestamp < shipment_started_at.saturating_sub(MAX_PAST_SKEW_SECONDS)
+            {
+                timestamp_ok = false;
+            }
+            if reading.temperature_celsius_x100 < PLAUSIBLE_MIN_CELSIUS_X100
+                || reading.temperature_celsius_x100 > PLAUSIBLE_MAX_CELSIUS_X100
+            {
+                plausible_ok = false;
+            }
+        }
+
+        let outcome = if !timestamp_ok {
+            BatchOutcome::RejectedTimestamp
+        } else if !plausible_ok {
+            device.implausible_count = device.implausible_count.saturating_add(1);
+            if device.implausible_count >= IMPLAUSIBLE_QUARANTINE_THRESHOLD {
+                device.quarantined = true;
+            }
+            BatchOutcome::RejectedImplausible
+        } else {
+            let mut state = storage::get_shipment_breach_state(&env, unit_id).unwrap_or_default();
+            for reading in readings.iter() {
+                let is_violation = reading.temperature_celsius_x100 < threshold.min_celsius_x100
+                    || reading.temperature_celsius_x100 > threshold.max_celsius_x100;
+                if is_violation {
+                    state.violation_count = state.violation_count.saturating_add(1);
+                    if state.violation_count == 1 {
+                        state.detected_at = reading.timestamp;
+                    }
+                    if reading.temperature_celsius_x100 > state.peak_celsius_x100 {
+                        state.peak_celsius_x100 = reading.temperature_celsius_x100;
+                    }
+                }
+            }
+            storage::set_shipment_breach_state(&env, unit_id, &state);
+            BatchOutcome::Accepted
+        };
+
+        storage::set_device(&env, device_id, &device);
+
+        let outcome_code: u32 = match outcome {
+            BatchOutcome::Accepted => 0,
+            BatchOutcome::RejectedTimestamp => 1,
+            BatchOutcome::RejectedImplausible => 2,
+        };
+        env.events().publish(
+            (symbol_short!("batch"),),
+            (device_id, unit_id, seq_start, seq_end, readings_hash, outcome_code),
+        );
+
+        if device.quarantined {
+            env.events()
+                .publish((symbol_short!("quarant"),), (device_id,));
+        }
+
+        Ok(outcome)
+    }
+
+    /// Read the shipment's current breach verdict, derived only from batches
+    /// that passed timestamp and plausibility validation under its pinned
+    /// threshold version.
+    pub fn get_shipment_verdict(env: Env, unit_id: u64) -> Result<ExcursionSummary, ContractError> {
+        let state = storage::get_shipment_breach_state(&env, unit_id)
+            .ok_or(ContractError::ShipmentVerdictNotFound)?;
+        Ok(ExcursionSummary {
+            unit_id,
+            violation_count: state.violation_count,
+            peak_celsius_x100: state.peak_celsius_x100,
+            detected_at: state.detected_at,
+        })
+    }
+
+    /// Read the shipment's evidence anchor (pinned config version + rolling
+    /// hash chain over every ingested batch) for off-chain arbiter verification.
+    ///
+    /// To independently reproduce a disputed verdict, an arbiter: (1) collects
+    /// every `batch` event for `unit_id`, ordered by `seq_start`; (2) for each,
+    /// recomputes `sha256(device_id || seq_start || seq_end || (temperature ||
+    /// timestamp)*)` over the off-chain-held raw readings and checks it matches
+    /// the event's `readings_hash`; (3) folds those hashes — starting from 32
+    /// zero bytes — via `chain_hash' = sha256(chain_hash || readings_hash)` and
+    /// checks the result and batch count match this anchor; (4) re-applies
+    /// `get_product_threshold(product_id, threshold_version)` (the *pinned*
+    /// version, not whatever is currently live) to every accepted batch's
+    /// readings and confirms the result matches `get_shipment_verdict`.
+    pub fn get_shipment_evidence(env: Env, unit_id: u64) -> Result<ShipmentEvidence, ContractError> {
+        storage::get_shipment_evidence(&env, unit_id).ok_or(ContractError::ShipmentEvidenceNotFound)
+    }
+
     // ── Upgradeability & versioned storage schema (#31) ──────────────────────
 
     /// Code version of the currently deployed binary.
@@ -506,6 +900,7 @@ impl TemperatureContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
 
     fn create_test_contract<'a>() -> (Env, Address, TemperatureContractClient<'a>) {
         let env = Env::default();
@@ -1061,6 +1456,448 @@ mod tests {
         let (env, _admin, client) = create_test_contract();
         let attacker = Address::generate(&env);
         client.pause(&attacker);
+    }
+
+    // ── Oracle authentication tests (#41) ─────────────────────────────────────
+    //
+    // Signature/hash fixtures below were generated offline with a real
+    // Ed25519 keypair (Node's built-in `crypto` module) over the exact byte
+    // layout `hash_batch_payload`/`submit_reading_batch` compute on-chain:
+    // `device_id || seq_start || seq_end || (temperature || timestamp)*` for
+    // the hash, and `device_id || seq_start || seq_end || readings_hash` for
+    // the signed message. This lets these tests exercise the real
+    // `ed25519_verify` host function instead of mocking it.
+
+    const NOW: u64 = 100_000;
+
+    fn set_ledger_time(env: &Env, ts: u64) {
+        env.ledger().with_mut(|li| li.timestamp = ts);
+    }
+
+    const DEVICE_PUBKEY: [u8; 32] = [
+        61, 96, 56, 225, 198, 42, 112, 73, 27, 145, 32, 19, 61, 101, 171, 209, 227, 47, 2, 25, 84,
+        11, 14, 70, 21, 191, 246, 244, 147, 51, 208, 68,
+    ];
+
+    fn pubkey(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &DEVICE_PUBKEY)
+    }
+
+    // device=1001 seq=1..=2, readings [(700,100000),(300,100001)]
+    const HASH_V1: [u8; 32] = [
+        25, 208, 85, 197, 211, 83, 164, 29, 84, 118, 159, 198, 176, 48, 95, 185, 188, 62, 80, 15,
+        21, 42, 216, 151, 232, 134, 97, 137, 223, 180, 220, 213,
+    ];
+    const SIG_V1: [u8; 64] = [
+        237, 131, 62, 220, 195, 8, 7, 213, 41, 18, 43, 30, 84, 75, 246, 185, 206, 4, 201, 105, 42,
+        82, 215, 17, 213, 173, 219, 122, 165, 143, 197, 185, 193, 26, 16, 109, 222, 124, 100, 189,
+        68, 83, 47, 197, 97, 245, 135, 62, 102, 39, 148, 210, 229, 65, 114, 73, 163, 159, 32, 193,
+        191, 252, 63, 13,
+    ];
+
+    // device=1001 seq=3..=3, readings [(650,100002)]
+    const HASH_V2: [u8; 32] = [
+        150, 49, 220, 155, 232, 90, 189, 212, 249, 5, 187, 243, 81, 157, 70, 252, 55, 144, 38, 40,
+        124, 53, 73, 140, 138, 173, 242, 147, 84, 125, 147, 28,
+    ];
+    const SIG_V2: [u8; 64] = [
+        0, 199, 202, 28, 37, 7, 248, 162, 52, 252, 70, 14, 89, 100, 100, 120, 16, 136, 40, 123,
+        217, 127, 61, 111, 184, 164, 130, 238, 18, 140, 198, 223, 189, 145, 106, 102, 202, 116,
+        138, 193, 25, 253, 172, 109, 124, 45, 43, 47, 206, 188, 250, 215, 94, 235, 132, 45, 88,
+        164, 52, 178, 197, 37, 42, 10,
+    ];
+
+    // device=1002 seq=1..=2, readings [(400,100000),(410,100001)]
+    const HASH_V3: [u8; 32] = [
+        160, 93, 209, 41, 234, 231, 116, 127, 114, 59, 78, 118, 194, 63, 217, 154, 67, 70, 101,
+        104, 36, 161, 127, 71, 16, 181, 155, 238, 247, 159, 218, 9,
+    ];
+    const SIG_V3: [u8; 64] = [
+        239, 199, 149, 150, 195, 159, 47, 9, 10, 203, 3, 58, 30, 43, 147, 39, 73, 96, 54, 50, 110,
+        169, 121, 158, 39, 169, 8, 233, 102, 69, 141, 250, 53, 139, 128, 161, 127, 14, 161, 141,
+        158, 70, 247, 27, 142, 76, 68, 51, 24, 81, 204, 51, 107, 235, 210, 229, 200, 9, 187, 221,
+        20, 175, 196, 11,
+    ];
+
+    // device=1003 seq=1..=1, readings [(400,100000)] — hash only, signature deliberately forged
+    const HASH_V4: [u8; 32] = [
+        65, 201, 235, 129, 7, 73, 232, 174, 25, 183, 66, 213, 125, 63, 40, 242, 173, 179, 215,
+        198, 47, 4, 11, 155, 84, 242, 40, 2, 68, 113, 7, 123,
+    ];
+    const SIG_V4: [u8; 64] = [
+        203, 122, 10, 82, 82, 115, 165, 169, 155, 206, 166, 165, 114, 71, 121, 81, 248, 23, 108,
+        129, 143, 13, 50, 105, 164, 44, 61, 241, 133, 164, 227, 55, 53, 206, 89, 66, 7, 61, 144,
+        180, 165, 36, 88, 103, 91, 92, 160, 196, 94, 147, 36, 78, 142, 70, 38, 145, 26, 186, 199,
+        245, 78, 139, 209, 13,
+    ];
+
+    // device=1005 seq=1..=1, readings [(400,999999999)] — far-future timestamp
+    const HASH_V5: [u8; 32] = [
+        157, 123, 109, 147, 135, 55, 123, 134, 162, 77, 158, 30, 80, 119, 247, 165, 28, 249, 223,
+        221, 47, 152, 112, 172, 204, 120, 183, 240, 148, 33, 132, 87,
+    ];
+    const SIG_V5: [u8; 64] = [
+        186, 64, 31, 184, 113, 228, 195, 139, 32, 52, 172, 99, 104, 200, 197, 197, 81, 55, 42,
+        182, 115, 153, 9, 233, 147, 236, 1, 133, 82, 24, 114, 6, 244, 240, 182, 127, 247, 249, 123,
+        180, 194, 241, 185, 13, 145, 191, 111, 46, 86, 102, 123, 216, 169, 184, 116, 35, 14, 255,
+        126, 21, 62, 202, 189, 2,
+    ];
+
+    // device=1006 seq=1..=1, readings [(999999,100000)] — implausible value
+    const HASH_V6: [u8; 32] = [
+        2, 164, 186, 103, 113, 89, 151, 98, 43, 63, 204, 2, 249, 239, 148, 153, 142, 126, 253,
+        120, 236, 19, 137, 94, 253, 172, 248, 243, 37, 15, 89, 220,
+    ];
+    const SIG_V6: [u8; 64] = [
+        250, 39, 158, 208, 30, 138, 252, 79, 192, 118, 182, 236, 149, 185, 47, 143, 27, 219, 170,
+        162, 201, 107, 160, 50, 181, 251, 232, 200, 37, 99, 6, 93, 186, 130, 246, 142, 77, 87, 4,
+        56, 156, 152, 24, 40, 154, 71, 45, 183, 123, 37, 31, 107, 106, 115, 44, 195, 244, 235, 235,
+        179, 121, 110, 193, 10,
+    ];
+
+    // device=1006 seq=2..=2, readings [(999999,100001)]
+    const HASH_V7: [u8; 32] = [
+        184, 72, 89, 245, 88, 43, 199, 253, 218, 124, 251, 126, 161, 196, 56, 134, 181, 55, 162,
+        85, 129, 198, 76, 23, 112, 208, 195, 162, 184, 217, 30, 149,
+    ];
+    const SIG_V7: [u8; 64] = [
+        20, 31, 15, 143, 11, 133, 113, 164, 207, 198, 214, 99, 143, 209, 176, 204, 67, 141, 47,
+        83, 245, 185, 78, 211, 93, 29, 211, 200, 164, 47, 141, 226, 219, 106, 227, 133, 20, 199,
+        173, 116, 249, 244, 66, 127, 72, 147, 156, 62, 244, 67, 68, 119, 71, 190, 58, 243, 144,
+        213, 2, 178, 129, 107, 225, 0,
+    ];
+
+    // device=1006 seq=3..=3, readings [(999999,100002)]
+    const HASH_V8: [u8; 32] = [
+        104, 234, 239, 180, 222, 9, 45, 145, 39, 98, 29, 24, 247, 245, 187, 196, 117, 55, 5, 241,
+        79, 226, 28, 36, 101, 250, 67, 27, 135, 216, 175, 195,
+    ];
+    const SIG_V8: [u8; 64] = [
+        210, 103, 168, 84, 110, 9, 145, 41, 157, 51, 137, 36, 54, 53, 194, 182, 72, 120, 94, 23,
+        117, 9, 241, 206, 165, 6, 255, 74, 29, 219, 94, 71, 137, 194, 200, 87, 78, 220, 236, 11,
+        51, 54, 84, 250, 242, 2, 25, 200, 149, 1, 171, 114, 57, 216, 133, 90, 228, 139, 19, 30,
+        179, 76, 57, 14,
+    ];
+
+    #[test]
+    fn test_unregistered_device_rejected() {
+        let (env, _admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let submitter = Address::generate(&env);
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: NOW }],
+        );
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let result = client.try_submit_reading_batch(
+            &submitter, &9999u64, &1u64, &1u64, &readings, &hash, &sig,
+        );
+        assert_eq!(result, Err(Ok(ContractError::DeviceNotRegistered)));
+    }
+
+    #[test]
+    fn test_submitter_mismatch_rejected() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        client.register_device(&admin, &1101u64, &gateway, &pubkey(&env), &1u64);
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: NOW }],
+        );
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let result = client.try_submit_reading_batch(
+            &attacker, &1101u64, &1u64, &1u64, &readings, &hash, &sig,
+        );
+        assert_eq!(result, Err(Ok(ContractError::SubmitterMismatch)));
+    }
+
+    /// Acceptance criterion: a shipment's breach verdict is judged under the
+    /// threshold version pinned at `start_shipment`, and a later
+    /// `set_product_threshold` call cannot retroactively change it.
+    #[test]
+    fn test_signed_batch_verdict_pinned_against_retroactive_threshold_change() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+
+        let gateway = Address::generate(&env);
+        let unit_id = 1u64;
+        let product_id = 1u64;
+
+        client.register_device(&admin, &1001u64, &gateway, &pubkey(&env), &unit_id);
+        let v1 = client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        assert_eq!(v1, 1);
+        let pinned = client.start_shipment(&admin, &unit_id, &product_id);
+        assert_eq!(pinned, 1);
+
+        let readings1 = Vec::from_array(
+            &env,
+            [
+                RawReading { temperature_celsius_x100: 700, timestamp: 100_000 },
+                RawReading { temperature_celsius_x100: 300, timestamp: 100_001 },
+            ],
+        );
+        let hash1 = BytesN::from_array(&env, &HASH_V1);
+        let sig1 = BytesN::from_array(&env, &SIG_V1);
+        let outcome1 = client.submit_reading_batch(
+            &gateway, &1001u64, &1u64, &2u64, &readings1, &hash1, &sig1,
+        );
+        assert_eq!(outcome1, BatchOutcome::Accepted);
+
+        let verdict = client.get_shipment_verdict(&unit_id);
+        assert_eq!(verdict.violation_count, 1);
+        assert_eq!(verdict.peak_celsius_x100, 700);
+        assert_eq!(verdict.detected_at, 100_000);
+
+        // Admin widens the product's threshold *after* the shipment started.
+        let v2 = client.set_product_threshold(&admin, &product_id, &0i32, &1000i32);
+        assert_eq!(v2, 2);
+
+        // The already-recorded verdict must be untouched by the retroactive change.
+        let verdict_after = client.get_shipment_verdict(&unit_id);
+        assert_eq!(verdict_after, verdict);
+
+        // A further batch on this shipment is still judged under the pinned v1
+        // threshold, not the newly-published (wider) v2.
+        let readings2 = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 650, timestamp: 100_002 }],
+        );
+        let hash2 = BytesN::from_array(&env, &HASH_V2);
+        let sig2 = BytesN::from_array(&env, &SIG_V2);
+        let outcome2 = client.submit_reading_batch(
+            &gateway, &1001u64, &3u64, &3u64, &readings2, &hash2, &sig2,
+        );
+        assert_eq!(outcome2, BatchOutcome::Accepted);
+
+        let final_verdict = client.get_shipment_verdict(&unit_id);
+        assert_eq!(
+            final_verdict.violation_count, 2,
+            "650 violates the pinned v1 threshold (200-600) even though v2 (0-1000) would allow it"
+        );
+        assert_eq!(final_verdict.peak_celsius_x100, 700);
+
+        let evidence = client.get_shipment_evidence(&unit_id);
+        assert_eq!(evidence.threshold_version, 1, "evidence anchor must report the pinned version");
+        assert_eq!(evidence.batch_count, 2);
+        assert_ne!(evidence.chain_hash, BytesN::from_array(&env, &[0u8; 32]));
+    }
+
+    /// Acceptance criterion: reused sequence numbers (a replayed batch) are rejected.
+    #[test]
+    fn test_reused_sequence_number_rejected() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let unit_id = 2u64;
+        let product_id = 2u64;
+
+        client.register_device(&admin, &1002u64, &gateway, &pubkey(&env), &unit_id);
+        client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        client.start_shipment(&admin, &unit_id, &product_id);
+
+        let readings = Vec::from_array(
+            &env,
+            [
+                RawReading { temperature_celsius_x100: 400, timestamp: 100_000 },
+                RawReading { temperature_celsius_x100: 410, timestamp: 100_001 },
+            ],
+        );
+        let hash = BytesN::from_array(&env, &HASH_V3);
+        let sig = BytesN::from_array(&env, &SIG_V3);
+
+        let first = client.submit_reading_batch(
+            &gateway, &1002u64, &1u64, &2u64, &readings, &hash, &sig,
+        );
+        assert_eq!(first, BatchOutcome::Accepted);
+
+        // Attacker replays the exact same (validly signed) batch.
+        let replay = client.try_submit_reading_batch(
+            &gateway, &1002u64, &1u64, &2u64, &readings, &hash, &sig,
+        );
+        assert_eq!(replay, Err(Ok(ContractError::InvalidSequence)));
+    }
+
+    /// Attack test: a batch "signed" by a device other than the one it claims
+    /// to be from must be rejected. `ed25519_verify` traps on failure, so
+    /// this surfaces as a panic rather than a typed error.
+    #[test]
+    #[should_panic]
+    fn test_forged_device_signature_rejected() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let unit_id = 3u64;
+        let product_id = 3u64;
+
+        client.register_device(&admin, &1003u64, &gateway, &pubkey(&env), &unit_id);
+        client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        client.start_shipment(&admin, &unit_id, &product_id);
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: 100_000 }],
+        );
+        // Hash correctly commits to the payload; signature does not.
+        let hash = BytesN::from_array(&env, &HASH_V4);
+        let forged_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.submit_reading_batch(
+            &gateway, &1003u64, &1u64, &1u64, &readings, &hash, &forged_sig,
+        );
+    }
+
+    #[test]
+    fn test_readings_hash_mismatch_rejected() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let unit_id = 4u64;
+        let product_id = 4u64;
+
+        client.register_device(&admin, &1003u64, &gateway, &pubkey(&env), &unit_id);
+        client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        client.start_shipment(&admin, &unit_id, &product_id);
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: 100_000 }],
+        );
+        let wrong_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let sig = BytesN::from_array(&env, &SIG_V4); // signed over the *correct* hash, not this one
+
+        let result = client.try_submit_reading_batch(
+            &gateway, &1003u64, &1u64, &1u64, &readings, &wrong_hash, &sig,
+        );
+        assert_eq!(result, Err(Ok(ContractError::ReadingsHashMismatch)));
+    }
+
+    #[test]
+    fn test_timestamp_out_of_window_rejected() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let unit_id = 5u64;
+        let product_id = 5u64;
+
+        client.register_device(&admin, &1005u64, &gateway, &pubkey(&env), &unit_id);
+        client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        client.start_shipment(&admin, &unit_id, &product_id);
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: 999_999_999 }],
+        );
+        let hash = BytesN::from_array(&env, &HASH_V5);
+        let sig = BytesN::from_array(&env, &SIG_V5);
+
+        let outcome = client.submit_reading_batch(
+            &gateway, &1005u64, &1u64, &1u64, &readings, &hash, &sig,
+        );
+        assert_eq!(outcome, BatchOutcome::RejectedTimestamp);
+
+        // A rejected-timestamp batch must never reach the shipment verdict.
+        let result = client.try_get_shipment_verdict(&unit_id);
+        assert_eq!(result, Err(Ok(ContractError::ShipmentVerdictNotFound)));
+    }
+
+    /// Attack test: an attempt to mask a real breach with an out-of-range
+    /// sensor value is excluded from the verdict, and repeated attempts
+    /// quarantine the device.
+    #[test]
+    fn test_implausible_readings_excluded_and_quarantine_device_after_threshold() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        let unit_id = 6u64;
+        let product_id = 6u64;
+
+        client.register_device(&admin, &1006u64, &gateway, &pubkey(&env), &unit_id);
+        client.set_product_threshold(&admin, &product_id, &200i32, &600i32);
+        client.start_shipment(&admin, &unit_id, &product_id);
+
+        let submit_implausible = |seq: u64, ts: u64, hash: &[u8; 32], sig: &[u8; 64]| {
+            let readings = Vec::from_array(
+                &env,
+                [RawReading { temperature_celsius_x100: 999_999, timestamp: ts }],
+            );
+            let hash = BytesN::from_array(&env, hash);
+            let sig = BytesN::from_array(&env, sig);
+            client.submit_reading_batch(&gateway, &1006u64, &seq, &seq, &readings, &hash, &sig)
+        };
+
+        let outcome1 = submit_implausible(1, 100_000, &HASH_V6, &SIG_V6);
+        assert_eq!(outcome1, BatchOutcome::RejectedImplausible);
+        let device1 = client.get_device(&1006u64);
+        assert_eq!(device1.implausible_count, 1);
+        assert!(!device1.quarantined);
+
+        let outcome2 = submit_implausible(2, 100_001, &HASH_V7, &SIG_V7);
+        assert_eq!(outcome2, BatchOutcome::RejectedImplausible);
+        let device2 = client.get_device(&1006u64);
+        assert_eq!(device2.implausible_count, 2);
+        assert!(!device2.quarantined);
+
+        let outcome3 = submit_implausible(3, 100_002, &HASH_V8, &SIG_V8);
+        assert_eq!(outcome3, BatchOutcome::RejectedImplausible);
+        let device3 = client.get_device(&1006u64);
+        assert_eq!(device3.implausible_count, 3);
+        assert!(device3.quarantined, "device must be quarantined after 3 implausible batches");
+
+        // The masked-breach attempt never reached the verdict.
+        let result = client.try_get_shipment_verdict(&unit_id);
+        assert_eq!(result, Err(Ok(ContractError::ShipmentVerdictNotFound)));
+
+        // Once quarantined, further batches are rejected outright.
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: 100_003 }],
+        );
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let result = client.try_submit_reading_batch(
+            &gateway, &1006u64, &4u64, &4u64, &readings, &hash, &sig,
+        );
+        assert_eq!(result, Err(Ok(ContractError::DeviceQuarantined)));
+    }
+
+    #[test]
+    fn test_device_already_registered_rejected() {
+        let (env, admin, client) = create_test_contract();
+        let gateway = Address::generate(&env);
+        client.register_device(&admin, &2000u64, &gateway, &pubkey(&env), &1u64);
+
+        let result =
+            client.try_register_device(&admin, &2000u64, &gateway, &pubkey(&env), &1u64);
+        assert_eq!(result, Err(Ok(ContractError::DeviceAlreadyRegistered)));
+    }
+
+    #[test]
+    fn test_submit_reading_batch_requires_shipment_started() {
+        let (env, admin, client) = create_test_contract();
+        set_ledger_time(&env, NOW);
+        let gateway = Address::generate(&env);
+        client.register_device(&admin, &2001u64, &gateway, &pubkey(&env), &7u64);
+        // No set_product_threshold / start_shipment call for unit 7.
+
+        let readings = Vec::from_array(
+            &env,
+            [RawReading { temperature_celsius_x100: 400, timestamp: 100_000 }],
+        );
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let result = client.try_submit_reading_batch(
+            &gateway, &2001u64, &1u64, &1u64, &readings, &hash, &sig,
+        );
+        assert_eq!(result, Err(Ok(ContractError::ShipmentNotStarted)));
     }
 }
 
