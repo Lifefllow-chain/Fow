@@ -46,6 +46,27 @@ pub struct Payment {
     pub dispute_resolved: bool,
     /// Token contract address — set only for escrow-backed payments.
     pub token: Option<Address>,
+
+    // ── Time-locked funds machinery (#45) ───────────────────────────────────
+    /// Challenge-window end (ledger ts). Frozen (does not advance the clock)
+    /// while a dispute is open; re-derived (extended by the dispute's
+    /// duration) once the dispute resolves. Zero for non-escrow payments.
+    pub release_after: u64,
+    /// Hard deadline (ledger ts): at or past this, ANYONE may call
+    /// `claim_expired_refund` regardless of dispute state — the
+    /// permissionless keeper exit so funds never depend on a live
+    /// counterparty. Only extended by cumulative pause duration. Zero for
+    /// non-escrow payments.
+    pub refund_after: u64,
+    /// After this ledger ts, `record_dispute` is rejected. Zero (disabled)
+    /// for non-escrow payments.
+    pub dispute_by: u64,
+    /// Snapshot of the contract's cumulative paused-seconds accumulator at
+    /// creation time, used to compute how much of it accrued *during* this
+    /// payment's lifetime (see `effective_refund_after`/`effective_release_after`).
+    pub pause_snapshot: u64,
+    /// Ledger ts the current dispute (if any) was opened at; cleared on resolution.
+    pub disputed_at: Option<u64>,
 }
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
@@ -106,6 +127,25 @@ pub struct VestingSchedule {
     pub claimed: i128,
 }
 
+/// A campaign's time-tranche release schedule: `amount` unlocks per tranche
+/// at its `unlock_at` ledger timestamp, vesting-style. Funds for the full
+/// tranche total are escrowed into the contract at creation; `claim_tranches`
+/// is a permissionless crank that sweeps every unlocked-but-unreleased
+/// tranche to `beneficiary` in one call.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    pub id: u64,
+    pub beneficiary: Address,
+    pub token: Address,
+    /// (unlock_at, amount) pairs, in the order provided at creation.
+    pub tranches: Vec<(u64, i128)>,
+    pub released_so_far: i128,
+    /// Address allowed to revoke the schedule and reclaim unreleased funds.
+    pub revocable_by: Address,
+    pub revoked: bool,
+}
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -141,6 +181,24 @@ pub enum Error {
     NoPendingUpgrade = 519,
     /// The upgrade timelock window has not elapsed yet.
     TimelockNotElapsed = 520,
+
+    // ── Time-locked funds machinery (#45) ───────────────────────────────────
+    /// `refund_after` (adjusted for pause time) has not yet been reached.
+    DeadlineNotReached = 521,
+    /// `dispute_by` has already passed; no new dispute may be opened.
+    DisputeWindowClosed = 522,
+    /// Payment is already in a terminal state (Released/Refunded/Cancelled).
+    PaymentTerminal = 523,
+    /// No tranche schedule exists under this id.
+    ScheduleNotFound = 524,
+    /// Tranche count exceeds the configured maximum.
+    TooManyTranches = 525,
+    /// Caller is not this schedule's configured revoker.
+    NotRevoker = 526,
+    /// Schedule has already been revoked.
+    ScheduleRevoked = 527,
+    /// Tranche list is empty or contains a non-positive amount.
+    InvalidTranches = 528,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -160,6 +218,24 @@ const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
 const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 /// Instance storage key for the dispute timeout override.
 const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
+
+// ── Time-locked funds machinery (#45) ───────────────────────────────────────
+
+/// Default challenge-window duration for a new escrow (3 days).
+const DEFAULT_RELEASE_WINDOW_SECS: u64 = 3 * 24 * 3600;
+/// Default window in which a dispute may be raised (14 days).
+const DEFAULT_DISPUTE_WINDOW_SECS: u64 = 14 * 24 * 3600;
+/// Default hard refund deadline — the permissionless keeper exit (30 days).
+const DEFAULT_REFUND_DEADLINE_SECS: u64 = 30 * 24 * 3600;
+/// Instance-level cumulative count of seconds the contract has spent paused,
+/// used to shift every escrow's deadlines forward by exactly however long
+/// they were unable to be acted on.
+const PAUSE_ACCUM: soroban_sdk::Symbol = symbol_short!("PAUSE_AC");
+/// Instance storage key holding the ledger ts of the current pause, if any.
+const PAUSE_SINCE: soroban_sdk::Symbol = symbol_short!("PAUSE_AT");
+/// Maximum tranches a single campaign [`Schedule`] may configure (#39).
+const MAX_TRANCHES: u32 = 24;
+const SCHEDULE_COUNTER: soroban_sdk::Symbol = symbol_short!("SCH_CTR");
 
 fn payment_key(id: u64) -> (u64, &'static str) {
     (id, "pay")
@@ -243,6 +319,28 @@ fn store_vesting(env: &Env, schedule: &VestingSchedule) {
 
 fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
     env.storage().persistent().get(&vesting_key(donor))
+}
+
+fn schedule_key(id: u64) -> (u64, &'static str) {
+    (id, "sch")
+}
+
+fn store_schedule(env: &Env, schedule: &Schedule) {
+    env.storage()
+        .persistent()
+        .set(&schedule_key(schedule.id), schedule);
+}
+
+fn load_schedule(env: &Env, id: u64) -> Option<Schedule> {
+    env.storage().persistent().get(&schedule_key(id))
+}
+
+fn get_schedule_counter(env: &Env) -> u64 {
+    env.storage().instance().get(&SCHEDULE_COUNTER).unwrap_or(0u64)
+}
+
+fn set_schedule_counter(env: &Env, val: u64) {
+    env.storage().instance().set(&SCHEDULE_COUNTER, &val);
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -463,6 +561,13 @@ impl PaymentContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&PAUSED_KEY, &true);
+        // Start (or leave running) the pause-duration clock used to extend
+        // every escrow's deadlines by however long the contract is down.
+        if !env.storage().instance().has(&PAUSE_SINCE) {
+            env.storage()
+                .instance()
+                .set(&PAUSE_SINCE, &env.ledger().timestamp());
+        }
         Ok(())
     }
 
@@ -477,6 +582,16 @@ impl PaymentContract {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&PAUSED_KEY, &false);
+        // Fold the just-ended pause into the cumulative accumulator so every
+        // escrow's effective deadlines shift forward by this pause's length.
+        if let Some(since) = env.storage().instance().get::<_, u64>(&PAUSE_SINCE) {
+            let now = env.ledger().timestamp();
+            let accum: u64 = env.storage().instance().get(&PAUSE_ACCUM).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&PAUSE_ACCUM, &accum.saturating_add(now.saturating_sub(since)));
+            env.storage().instance().remove(&PAUSE_SINCE);
+        }
         Ok(())
     }
 
@@ -551,6 +666,11 @@ impl PaymentContract {
             dispute_case_id: None,
             dispute_resolved: false,
             token: None,
+            release_after: 0,
+            refund_after: 0,
+            dispute_by: 0,
+            pause_snapshot: 0,
+            disputed_at: None,
         };
 
         store_payment(&env, &payment);
@@ -588,6 +708,9 @@ impl PaymentContract {
 
     /// Create an escrow-backed payment: transfers `amount` of `token` from
     /// `hospital` into the contract immediately, locking the funds on-chain.
+    /// Deadlines default to `DEFAULT_RELEASE_WINDOW_SECS`/
+    /// `DEFAULT_DISPUTE_WINDOW_SECS`/`DEFAULT_REFUND_DEADLINE_SECS`; use
+    /// `create_escrow_with_deadlines` to configure them explicitly.
     pub fn create_escrow(
         env: Env,
         request_id: u64,
@@ -595,6 +718,57 @@ impl PaymentContract {
         payee: Address,
         amount: i128,
         token: Address,
+    ) -> Result<u64, Error> {
+        Self::create_escrow_impl(
+            env,
+            request_id,
+            hospital,
+            payee,
+            amount,
+            token,
+            DEFAULT_RELEASE_WINDOW_SECS,
+            DEFAULT_DISPUTE_WINDOW_SECS,
+            DEFAULT_REFUND_DEADLINE_SECS,
+        )
+    }
+
+    /// Same as `create_escrow`, with explicit deadline durations (seconds
+    /// from creation) for the challenge window, dispute window, and hard
+    /// refund deadline (#45's time-locked funds machinery).
+    pub fn create_escrow_with_deadlines(
+        env: Env,
+        request_id: u64,
+        hospital: Address,
+        payee: Address,
+        amount: i128,
+        token: Address,
+        release_after_secs: u64,
+        dispute_by_secs: u64,
+        refund_after_secs: u64,
+    ) -> Result<u64, Error> {
+        Self::create_escrow_impl(
+            env,
+            request_id,
+            hospital,
+            payee,
+            amount,
+            token,
+            release_after_secs,
+            dispute_by_secs,
+            refund_after_secs,
+        )
+    }
+
+    fn create_escrow_impl(
+        env: Env,
+        request_id: u64,
+        hospital: Address,
+        payee: Address,
+        amount: i128,
+        token: Address,
+        release_after_secs: u64,
+        dispute_by_secs: u64,
+        refund_after_secs: u64,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env)?;
         if amount <= 0 {
@@ -631,6 +805,7 @@ impl PaymentContract {
         set_counter(&env, id);
 
         let now = env.ledger().timestamp();
+        let pause_snapshot: u64 = env.storage().instance().get(&PAUSE_ACCUM).unwrap_or(0);
         let payment = Payment {
             id,
             request_id,
@@ -644,6 +819,11 @@ impl PaymentContract {
             dispute_case_id: None,
             dispute_resolved: false,
             token: Some(token.clone()),
+            release_after: now.saturating_add(release_after_secs),
+            dispute_by: now.saturating_add(dispute_by_secs),
+            refund_after: now.saturating_add(refund_after_secs),
+            pause_snapshot,
+            disputed_at: None,
         };
 
         store_payment(&env, &payment);
@@ -762,12 +942,19 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        let now = env.ledger().timestamp();
+        // dispute_by == 0 means no deadline was configured (non-escrow
+        // payments), so disputes on those remain unconstrained as before.
+        if payment.dispute_by != 0 && now > payment.dispute_by {
+            return Err(Error::DisputeWindowClosed);
+        }
         let old_status = payment.status;
         payment.status = PaymentStatus::Disputed;
         payment.dispute_reason_code = Some(dispute_reason_to_code(reason));
         payment.dispute_case_id = Some(case_id.clone());
         payment.dispute_resolved = false;
-        payment.updated_at = env.ledger().timestamp();
+        payment.disputed_at = Some(now);
+        payment.updated_at = now;
         store_payment(&env, &payment);
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, PaymentStatus::Disputed, payment_id);
@@ -786,10 +973,19 @@ impl PaymentContract {
     pub fn resolve_dispute(env: Env, payment_id: u64) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        let now = env.ledger().timestamp();
         if payment.dispute_case_id.is_some() {
             payment.dispute_resolved = true;
         }
-        payment.updated_at = env.ledger().timestamp();
+        // Re-derive the challenge window: a dispute freezes `release_after`
+        // while open, so push it out by exactly how long this dispute took,
+        // restoring the window's original remaining duration.
+        if let Some(disputed_at) = payment.disputed_at {
+            let dispute_duration = now.saturating_sub(disputed_at);
+            payment.release_after = payment.release_after.saturating_add(dispute_duration);
+            payment.disputed_at = None;
+        }
+        payment.updated_at = now;
         store_payment(&env, &payment);
         env.events().publish(
             (
@@ -1160,6 +1356,257 @@ impl PaymentContract {
         }
 
         Ok(refunded)
+    }
+
+    // ── Time-locked funds machinery (#45) ─────────────────────────────────────
+
+    /// Deadline `X` shifts forward by however many of the contract's total
+    /// paused seconds occurred *during* this payment's lifetime (i.e. after
+    /// it was created) — pauses before creation are already baked out of
+    /// `pause_snapshot` and don't apply.
+    fn pause_extension(env: &Env, payment: &Payment) -> u64 {
+        let current_accum: u64 = env.storage().instance().get(&PAUSE_ACCUM).unwrap_or(0);
+        current_accum.saturating_sub(payment.pause_snapshot)
+    }
+
+    fn effective_refund_after(env: &Env, payment: &Payment) -> u64 {
+        payment.refund_after.saturating_add(Self::pause_extension(env, payment))
+    }
+
+    fn effective_release_after(env: &Env, payment: &Payment) -> u64 {
+        payment.release_after.saturating_add(Self::pause_extension(env, payment))
+    }
+
+    /// Read the three deadlines as they currently apply: `(effective
+    /// release_after, effective refund_after, dispute_by)` — i.e. `dispute_by`
+    /// and `refund_after` are unaffected by an open dispute, only by
+    /// cumulative pause time; `release_after` additionally reflects any
+    /// dispute-resolution re-derivation already applied.
+    pub fn get_effective_deadlines(env: Env, payment_id: u64) -> Result<(u64, u64, u64), Error> {
+        let payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        Ok((
+            Self::effective_release_after(&env, &payment),
+            Self::effective_refund_after(&env, &payment),
+            payment.dispute_by,
+        ))
+    }
+
+    /// Permissionless keeper crank: refund an escrow to its payer once
+    /// `refund_after` (adjusted for pause time) has passed. Callable by
+    /// *anyone* — no `require_auth` on a specific party — so a payment's
+    /// exit never depends on a live counterparty or admin action. An open
+    /// dispute does **not** block this call (only the hard deadline and the
+    /// pause-time extension matter).
+    ///
+    /// # Errors
+    /// - `PaymentNotFound`   - No payment with this id
+    /// - `NotEscrowPayment`  - Payment has no escrowed token
+    /// - `PaymentTerminal`   - Payment is already Released/Refunded/Cancelled
+    /// - `DeadlineNotReached` - `refund_after` (as adjusted) hasn't passed yet
+    pub fn claim_expired_refund(env: Env, payment_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
+
+        if !matches!(payment.status, PaymentStatus::Locked | PaymentStatus::Disputed) {
+            return Err(Error::PaymentTerminal);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < Self::effective_refund_after(&env, &payment) {
+            return Err(Error::DeadlineNotReached);
+        }
+
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &payment.payer,
+            &payment.amount,
+        );
+
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Refunded;
+        payment.updated_at = now;
+        store_payment(&env, &payment);
+        remove_from_status_index(&env, old_status, payment_id);
+        index_by_status(&env, PaymentStatus::Refunded, payment_id);
+        update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded);
+
+        env.events().publish(
+            (
+                symbol_short!("payment"),
+                symbol_short!("refunded"),
+                symbol_short!("keeper"),
+            ),
+            (payment_id, payment.payer.clone(), payment.amount),
+        );
+        Ok(())
+    }
+
+    // ── Campaign tranche schedules (#45) ──────────────────────────────────────
+
+    /// Create a campaign tranche schedule: `funder` escrows the sum of every
+    /// tranche's amount into the contract immediately; funds unlock for
+    /// `beneficiary` per-tranche as each `unlock_at` ledger ts is reached.
+    /// `revocable_by` may later revoke the schedule via `revoke_schedule`.
+    ///
+    /// # Errors
+    /// - `InvalidTranches` - Empty tranche list, or a non-positive amount
+    /// - `TooManyTranches` - More than `MAX_TRANCHES` tranches configured
+    /// - `InsufficientEscrowFunds` - `funder` cannot cover the tranche total
+    pub fn create_schedule(
+        env: Env,
+        funder: Address,
+        beneficiary: Address,
+        token: Address,
+        tranches: Vec<(u64, i128)>,
+        revocable_by: Address,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env)?;
+        funder.require_auth();
+
+        if tranches.is_empty() {
+            return Err(Error::InvalidTranches);
+        }
+        if tranches.len() > MAX_TRANCHES {
+            return Err(Error::TooManyTranches);
+        }
+
+        // Tranches must be in non-decreasing unlock_at order: `claim_tranches`
+        // walks them in schedule order and relies on that order matching
+        // unlock order to know which prefix has already been paid out.
+        let mut total: i128 = 0;
+        let mut prev_unlock_at: u64 = 0;
+        for i in 0..tranches.len() {
+            let (unlock_at, amount) = tranches.get(i).unwrap();
+            if amount <= 0 || unlock_at < prev_unlock_at {
+                return Err(Error::InvalidTranches);
+            }
+            prev_unlock_at = unlock_at;
+            total += amount;
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        if token_client.balance(&funder) < total {
+            return Err(Error::InsufficientEscrowFunds);
+        }
+        token_client.transfer(&funder, &env.current_contract_address(), &total);
+
+        let id = get_schedule_counter(&env) + 1;
+        set_schedule_counter(&env, id);
+
+        let schedule = Schedule {
+            id,
+            beneficiary: beneficiary.clone(),
+            token,
+            tranches,
+            released_so_far: 0,
+            revocable_by,
+            revoked: false,
+        };
+        store_schedule(&env, &schedule);
+
+        env.events().publish(
+            (symbol_short!("schedule"), symbol_short!("created")),
+            (id, beneficiary, total),
+        );
+
+        Ok(id)
+    }
+
+    pub fn get_schedule(env: Env, schedule_id: u64) -> Result<Schedule, Error> {
+        load_schedule(&env, schedule_id).ok_or(Error::ScheduleNotFound)
+    }
+
+    /// Permissionless crank: release every tranche whose `unlock_at` has
+    /// passed and that hasn't already been released, in one transfer to
+    /// `beneficiary`. Emits one event per newly-released tranche so the
+    /// schedule's `released_so_far` is always reconstructable purely from
+    /// events. Never releases early, and never re-releases an already-swept
+    /// tranche even if called repeatedly.
+    pub fn claim_tranches(env: Env, schedule_id: u64) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
+        let mut schedule = load_schedule(&env, schedule_id).ok_or(Error::ScheduleNotFound)?;
+        if schedule.revoked {
+            return Err(Error::ScheduleRevoked);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // released_so_far always equals the sum of tranche amounts (in
+        // schedule order) already unlocked as of the last successful claim,
+        // so tranches unlock strictly in order and none is ever double-paid.
+        let mut running: i128 = 0;
+        let mut newly_released: i128 = 0;
+        for i in 0..schedule.tranches.len() {
+            let (unlock_at, amount) = schedule.tranches.get(i).unwrap();
+            if unlock_at <= now {
+                if running >= schedule.released_so_far {
+                    newly_released += amount;
+                    env.events().publish(
+                        (symbol_short!("schedule"), symbol_short!("tranche")),
+                        (schedule_id, i, unlock_at, amount),
+                    );
+                }
+                running += amount;
+            }
+        }
+
+        if newly_released <= 0 {
+            return Err(Error::NothingToClaim);
+        }
+
+        schedule.released_so_far += newly_released;
+        store_schedule(&env, &schedule);
+
+        let token_client = token::Client::new(&env, &schedule.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &schedule.beneficiary,
+            &newly_released,
+        );
+
+        Ok(newly_released)
+    }
+
+    /// Revoke a schedule and return every not-yet-released tranche amount to
+    /// the caller. Only `revocable_by` may call this. Once revoked, no
+    /// further tranches (even already-unlocked ones) may be claimed.
+    pub fn revoke_schedule(env: Env, caller: Address, schedule_id: u64) -> Result<i128, Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        let mut schedule = load_schedule(&env, schedule_id).ok_or(Error::ScheduleNotFound)?;
+        if caller != schedule.revocable_by {
+            return Err(Error::NotRevoker);
+        }
+        if schedule.revoked {
+            return Err(Error::ScheduleRevoked);
+        }
+
+        let total: i128 = {
+            let mut sum: i128 = 0;
+            for i in 0..schedule.tranches.len() {
+                let (_, amount) = schedule.tranches.get(i).unwrap();
+                sum += amount;
+            }
+            sum
+        };
+        let remaining = total - schedule.released_so_far;
+
+        schedule.revoked = true;
+        store_schedule(&env, &schedule);
+
+        if remaining > 0 {
+            let token_client = token::Client::new(&env, &schedule.token);
+            token_client.transfer(&env.current_contract_address(), &caller, &remaining);
+        }
+
+        env.events().publish(
+            (symbol_short!("schedule"), symbol_short!("revoked")),
+            (schedule_id, remaining),
+        );
+
+        Ok(remaining)
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────────

@@ -804,6 +804,411 @@ fn test_vesting_events_emitted() {
     assert_eq!(schedule.claimed, 200_000i128);
 }
 
+// ── Time-locked funds machinery (#45) ───────────────────────────────────────────
+//
+// Decision-table coverage for the dispute × pause × deadline precedence
+// rules: an open dispute freezes `release_after` but never `refund_after`'s
+// permissionless exit; pauses extend every deadline by exactly however long
+// the contract was down; a resolved dispute re-derives (extends)
+// `release_after` by the dispute's duration.
+
+fn make_escrow(
+    env: &Env,
+    client: &PaymentContractClient,
+    admin: &Address,
+    request_id: u64,
+    amount: i128,
+) -> (u64, Address, Address, Address) {
+    let hospital = Address::generate(env);
+    let payee = Address::generate(env);
+    let token_id = deploy_token_with_balance(env, admin, &hospital, amount);
+    let id = client.create_escrow(&request_id, &hospital, &payee, &amount, &token_id);
+    (id, hospital, payee, token_id)
+}
+
+// ── claim_expired_refund: acceptance criterion 1 ────────────────────────────
+
+/// Any escrow past refund_after is refundable by an arbitrary third party in
+/// one call.
+#[test]
+fn test_claim_expired_refund_by_arbitrary_third_party_after_deadline() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, hospital, _payee, _token) = make_escrow(&env, &client, &admin, 1, 1_000);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS);
+
+    // `claim_expired_refund` takes no caller/auth parameter at all — its
+    // signature itself is the permissionless-keeper guarantee. Any address
+    // (including one unrelated to payer/payee, as here) can submit it.
+    client.claim_expired_refund(&pid);
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Refunded);
+    assert_eq!(p.payer, hospital);
+}
+
+#[test]
+fn test_claim_expired_refund_fails_before_deadline() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 2, 1_000);
+
+    let result = client.try_claim_expired_refund(&pid);
+    assert_eq!(result, Err(Ok(Error::DeadlineNotReached)));
+}
+
+/// Boundary equality: `now == refund_after` counts as reached.
+#[test]
+fn test_claim_expired_refund_boundary_equality_succeeds() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 3, 1_000);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS);
+    client.claim_expired_refund(&pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Refunded);
+}
+
+#[test]
+fn test_claim_expired_refund_fails_on_non_escrow_payment() {
+    let (env, cid, _admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, _, _) = make_payment(&env, &client, 4, 100);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS * 10);
+    let result = client.try_claim_expired_refund(&pid);
+    assert_eq!(result, Err(Ok(Error::NotEscrowPayment)));
+}
+
+#[test]
+fn test_claim_expired_refund_fails_on_terminal_payment() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 5, 1_000);
+    client.release_escrow(&admin, &pid);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS);
+    let result = client.try_claim_expired_refund(&pid);
+    assert_eq!(result, Err(Ok(Error::PaymentTerminal)));
+}
+
+// ── Dispute × deadline precedence ────────────────────────────────────────────
+
+/// KEY RULE: an open dispute does NOT freeze `refund_after`'s permissionless
+/// exit — same-ledger race between "dispute opened" and "deadline reached".
+#[test]
+fn test_open_dispute_does_not_block_permissionless_refund_after_deadline() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 6, 1_000);
+    client.record_dispute(
+        &pid,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case-open"),
+    );
+
+    // Dispute remains open (never resolved) all the way past refund_after.
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS);
+    client.claim_expired_refund(&pid);
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Refunded);
+}
+
+/// An open dispute doesn't change the deadline check itself — still fails
+/// before the hard deadline regardless of dispute state.
+#[test]
+fn test_open_dispute_before_deadline_still_fails() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 7, 1_000);
+    client.record_dispute(
+        &pid,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case-early"),
+    );
+
+    let result = client.try_claim_expired_refund(&pid);
+    assert_eq!(result, Err(Ok(Error::DeadlineNotReached)));
+}
+
+/// Resolving a dispute re-derives `release_after`, extending it by exactly
+/// the dispute's duration.
+#[test]
+fn test_resolve_dispute_extends_release_after_by_dispute_duration() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 8, 1_000);
+    let (release_before, _, _) = client.get_effective_deadlines(&pid);
+
+    client.record_dispute(
+        &pid,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case-dur"),
+    );
+
+    let dispute_duration = 5_000u64;
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + dispute_duration);
+    client.resolve_dispute(&pid);
+
+    let (release_after, _, _) = client.get_effective_deadlines(&pid);
+    assert_eq!(release_after, release_before + dispute_duration);
+}
+
+/// `record_dispute` is rejected once `dispute_by` has passed.
+#[test]
+fn test_record_dispute_rejected_after_dispute_window_closes() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 9, 1_000);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_DISPUTE_WINDOW_SECS + 1);
+    let result = client.try_record_dispute(
+        &pid,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "too-late"),
+    );
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+}
+
+// ── Pause × deadline precedence ──────────────────────────────────────────────
+
+/// KEY RULE: a pause extends every escrow's deadline by exactly the pause's
+/// duration — reaching the *original* refund_after isn't enough once the
+/// contract has been paused in between.
+#[test]
+fn test_pause_extends_refund_after_by_pause_duration() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 10, 1_000);
+
+    let pause_duration = 10_000u64;
+    client.pause(&admin);
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + pause_duration);
+    client.unpause(&admin);
+
+    // Original refund_after has been reached, but the pause should have
+    // pushed the effective deadline out by `pause_duration`.
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS);
+    let result = client.try_claim_expired_refund(&pid);
+    assert_eq!(
+        result,
+        Err(Ok(Error::DeadlineNotReached)),
+        "pause must extend refund_after, not just release_after"
+    );
+
+    // Once the extension has also elapsed, the refund succeeds.
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1_000 + DEFAULT_REFUND_DEADLINE_SECS + pause_duration);
+    client.claim_expired_refund(&pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Refunded);
+}
+
+/// A pause that happened *before* a payment was created must not extend
+/// that payment's deadlines (only pauses during its lifetime count).
+#[test]
+fn test_pause_before_creation_does_not_extend_deadline() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    client.pause(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_500);
+    client.unpause(&admin); // 500s pause, before the payment exists
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 11, 1_000);
+
+    let (_, refund_after, _) = client.get_effective_deadlines(&pid);
+    assert_eq!(refund_after, 2_000 + DEFAULT_REFUND_DEADLINE_SECS);
+}
+
+/// Far-future ledger timestamps must saturate rather than overflow/panic.
+#[test]
+fn test_deadlines_saturate_on_far_future_timestamp() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| l.timestamp = u64::MAX - 100);
+    let (pid, ..) = make_escrow(&env, &client, &admin, 12, 1_000);
+
+    let (release_after, refund_after, dispute_by) = client.get_effective_deadlines(&pid);
+    assert_eq!(refund_after, u64::MAX);
+    assert_eq!(release_after, u64::MAX);
+    assert_eq!(dispute_by, u64::MAX);
+}
+
+// ── Campaign tranche schedules (#45) ────────────────────────────────────────
+
+fn make_tranches(env: &Env, pairs: &[(u64, i128)]) -> Vec<(u64, i128)> {
+    let mut v: Vec<(u64, i128)> = Vec::new(env);
+    for pair in pairs {
+        v.push_back(*pair);
+    }
+    v
+}
+
+/// A campaign schedule never releases before a tranche's unlock time.
+#[test]
+fn test_schedule_releases_nothing_before_first_unlock() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 300);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let tranches = make_tranches(&env, &[(2_000, 100), (3_000, 200)]);
+    let sid = client.create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+
+    let result = client.try_claim_tranches(&sid);
+    assert_eq!(result, Err(Ok(Error::NothingToClaim)));
+}
+
+/// A schedule releases exactly its configured amounts, never early, and its
+/// released total is reconstructable from the `schedule`/`tranche` events
+/// (each claim emits one event per newly-unlocked tranche).
+#[test]
+fn test_schedule_releases_exact_amounts_in_order() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 300);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let tranches = make_tranches(&env, &[(2_000, 100), (3_000, 200)]);
+    let sid = client.create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+
+    // Only the first tranche has unlocked.
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    let released = client.claim_tranches(&sid);
+    assert_eq!(released, 100);
+    assert_eq!(client.get_schedule(&sid).released_so_far, 100);
+
+    // Re-cranking before the next unlock yields nothing (never early, never
+    // double-paid).
+    let result = client.try_claim_tranches(&sid);
+    assert_eq!(result, Err(Ok(Error::NothingToClaim)));
+
+    env.ledger().with_mut(|l| l.timestamp = 3_000);
+    let released2 = client.claim_tranches(&sid);
+    assert_eq!(released2, 200);
+    assert_eq!(client.get_schedule(&sid).released_so_far, 300);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(token_client.balance(&beneficiary), 300);
+}
+
+#[test]
+fn test_schedule_rejects_out_of_order_tranches() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 300);
+
+    let tranches = make_tranches(&env, &[(3_000, 100), (2_000, 200)]);
+    let result =
+        client.try_create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+    assert_eq!(result, Err(Ok(Error::InvalidTranches)));
+}
+
+#[test]
+fn test_schedule_rejects_too_many_tranches() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 1_000);
+
+    let mut tranches: Vec<(u64, i128)> = Vec::new(&env);
+    for i in 0..(MAX_TRANCHES + 1) {
+        tranches.push_back((1_000u64 + i as u64, 1i128));
+    }
+    let result =
+        client.try_create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+    assert_eq!(result, Err(Ok(Error::TooManyTranches)));
+}
+
+#[test]
+fn test_schedule_revoke_returns_unreleased_and_blocks_further_claims() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 300);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let tranches = make_tranches(&env, &[(2_000, 100), (3_000, 200)]);
+    let sid = client.create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    client.claim_tranches(&sid);
+
+    let returned = client.revoke_schedule(&revoker, &sid);
+    assert_eq!(returned, 200);
+
+    let token_client = token::Client::new(&env, &token_id);
+    assert_eq!(token_client.balance(&revoker), 200);
+
+    env.ledger().with_mut(|l| l.timestamp = 3_000);
+    let result = client.try_claim_tranches(&sid);
+    assert_eq!(result, Err(Ok(Error::ScheduleRevoked)));
+}
+
+#[test]
+fn test_schedule_revoke_only_by_configured_revoker() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let funder = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let revoker = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &funder, 100);
+
+    let tranches = make_tranches(&env, &[(2_000, 100)]);
+    let sid = client.create_schedule(&funder, &beneficiary, &token_id, &tranches, &revoker);
+
+    let result = client.try_revoke_schedule(&attacker, &sid);
+    assert_eq!(result, Err(Ok(Error::NotRevoker)));
+}
+
 // ── Timelocked upgradeability & versioned schema (#31) ─────────────────────────
 
 #[test]
