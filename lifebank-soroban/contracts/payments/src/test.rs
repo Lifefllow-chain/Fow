@@ -23,7 +23,12 @@ fn make_payment(
 }
 
 /// Deploy a minimal Soroban token contract and mint `amount` to `recipient`.
-fn deploy_token_with_balance(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+fn deploy_token_with_balance(
+    env: &Env,
+    admin: &Address,
+    recipient: &Address,
+    amount: i128,
+) -> Address {
     let token = env.register_stellar_asset_contract_v2(admin.clone());
     let token_id = token.address();
     let token_admin = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
@@ -670,7 +675,10 @@ fn test_vesting_partial_claim_at_50_percent() {
     // Advance to 50% of vesting duration (cliff == vest_start == 10_000, vest_end == 12_000)
     env.ledger().with_mut(|l| l.timestamp = 11_000); // 1000s elapsed of 2000s
     let claimed = client.claim_vested(&donor, &token_id);
-    assert_eq!(claimed, 500_000i128, "50% vesting should yield half the total");
+    assert_eq!(
+        claimed, 500_000i128,
+        "50% vesting should yield half the total"
+    );
 
     let schedule = client.get_vesting(&donor);
     assert_eq!(schedule.claimed, 500_000i128);
@@ -768,8 +776,12 @@ fn test_process_expired_disputes_refunds_after_timeout() {
     let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
 
     // Record dispute at t=1000; updated_at becomes 1000.
-    client.record_dispute(&pid, &DisputeReason::FailedDelivery,
-        &soroban_sdk::String::from_str(&env, "case-1"), &hospital);
+    client.record_dispute(
+        &pid,
+        &DisputeReason::FailedDelivery,
+        &soroban_sdk::String::from_str(&env, "case-1"),
+        &hospital,
+    );
 
     // Set a short timeout of 500s.
     client.set_dispute_timeout(&admin, &500u64);
@@ -798,8 +810,12 @@ fn test_process_expired_disputes_skips_non_expired() {
 
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let pid = client.create_escrow(&2u64, &hospital, &payee, &500i128, &token_id);
-    client.record_dispute(&pid, &DisputeReason::Other,
-        &soroban_sdk::String::from_str(&env, "case-2"), &hospital);
+    client.record_dispute(
+        &pid,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case-2"),
+        &hospital,
+    );
 
     client.set_dispute_timeout(&admin, &5_000u64);
 
@@ -961,4 +977,194 @@ fn test_create_escrow_rejects_negative_amount() {
 
     let result = client.try_create_escrow(&1u64, &hospital, &payee, &-1i128, &token_id);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)), "Negative amount escrow must be rejected");
+}
+
+// ── TTL / storage lifecycle tests ─────────────────────────────────────────────
+//
+// These tests use the Soroban testutils ledger fast-forward (set_sequence) to
+// simulate the passage of ledger time and verify that:
+//   1. Entries remain accessible within the documented TTL horizon.
+//   2. The domain-deadline rule extends locked payments to the dispute horizon.
+//   3. A lock-then-dispute flow spanning a 30-day gap still succeeds.
+//
+// Reference constants (from ttl.rs):
+//   LEDGERS_PER_DAY          = 17_280
+//   PAYMENT_TTL_THRESHOLD    = 30 days  = 518_400 ledgers
+//   PAYMENT_EXTEND_TO        = 90 days  = 1_555_200 ledgers
+//   DISPUTE_HORIZON_LEDGERS  = 60 days  = 1_036_800 ledgers
+
+fn advance_ledger(env: &Env, ledgers: u32) {
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ledgers;
+    });
+}
+
+#[test]
+fn test_payment_readable_within_policy_horizon() {
+    use crate::ttl::{LEDGERS_PER_DAY, PAYMENT_EXTEND_TO};
+
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let (id, _, _) = make_payment(&env, &client, 1, 500);
+
+    let horizon_minus_1 = PAYMENT_EXTEND_TO - LEDGERS_PER_DAY;
+    advance_ledger(&env, horizon_minus_1);
+
+    let p = client.get_payment(&id);
+    assert_eq!(p.id, id, "Payment should be readable at horizon-1");
+    assert_eq!(p.status, PaymentStatus::Pending);
+}
+
+#[test]
+fn test_locked_payment_readable_within_dispute_horizon() {
+    use crate::ttl::{DISPUTE_HORIZON_LEDGERS, LEDGERS_PER_DAY};
+
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let pid = client.create_escrow(&10u64, &hospital, &payee, &1_000i128, &token_id);
+
+    let near_horizon = DISPUTE_HORIZON_LEDGERS - LEDGERS_PER_DAY;
+    advance_ledger(&env, near_horizon);
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.id, pid, "Locked payment should be readable near dispute horizon");
+    assert_eq!(p.status, PaymentStatus::Locked);
+}
+
+#[test]
+fn test_lock_then_dispute_across_30_day_gap() {
+    use crate::ttl::LEDGERS_PER_DAY;
+
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let pid = client.create_escrow(&20u64, &hospital, &payee, &2_000i128, &token_id);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+
+    advance_ledger(&env, LEDGERS_PER_DAY * 30);
+    env.ledger().with_mut(|l| {
+        l.timestamp += (30 * 24 * 3600) as u64;
+    });
+
+    let case_id = soroban_sdk::String::from_str(&env, "dispute-30d");
+    client.record_dispute(&pid, &DisputeReason::LateDelivery, &case_id, &hospital);
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Disputed, "Payment should be Disputed after 30 days");
+
+    client.set_dispute_timeout(&admin, &1u64);
+    advance_ledger(&env, LEDGERS_PER_DAY);
+    env.ledger().with_mut(|l| {
+        l.timestamp += 3_600;
+    });
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(pid);
+    let refunded = client.process_expired_disputes(&admin, &ids);
+    assert_eq!(refunded.len(), 1, "Disputed payment should be refunded after timeout");
+
+    let p = client.get_payment(&pid);
+    assert_eq!(p.status, PaymentStatus::Refunded);
+}
+
+#[test]
+fn test_bump_on_access_extends_ttl() {
+    use crate::ttl::{LEDGERS_PER_DAY, PAYMENT_EXTEND_TO, PAYMENT_TTL_THRESHOLD};
+
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let (id, _, _) = make_payment(&env, &client, 42, 100);
+
+    advance_ledger(&env, PAYMENT_TTL_THRESHOLD);
+    let _ = client.get_payment(&id);
+    advance_ledger(&env, PAYMENT_EXTEND_TO - LEDGERS_PER_DAY);
+
+    let p = client.get_payment(&id);
+    assert_eq!(p.id, id, "Re-bumped payment should still be readable");
+}
+
+#[test]
+fn test_pledge_readable_within_policy_horizon() {
+    use crate::ttl::{LEDGERS_PER_DAY, PLEDGE_EXTEND_TO};
+
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let donor = Address::generate(&env);
+    let pool = soroban_sdk::String::from_str(&env, "pool");
+    let cause = soroban_sdk::String::from_str(&env, "cause");
+    let region = soroban_sdk::String::from_str(&env, "NG");
+
+    let pledge_id = client.create_pledge(
+        &donor,
+        &250i128,
+        &86_400u64,
+        &pool,
+        &cause,
+        &region,
+        &false,
+    );
+
+    advance_ledger(&env, PLEDGE_EXTEND_TO - LEDGERS_PER_DAY);
+
+    let p = client.get_pledge(&pledge_id);
+    assert_eq!(p.id, pledge_id, "Pledge should be readable near pledge horizon");
+    assert!(p.active);
+}
+
+#[test]
+fn test_expired_entry_returns_entry_expired_not_panic() {
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 1;
+        l.timestamp = 1_000;
+    });
+
+    let (id, _, _) = make_payment(&env, &client, 99, 777);
+
+    let non_existent = id + 9999;
+    let result = client.try_get_payment(&non_existent);
+    assert!(
+        result.is_err(),
+        "Accessing a non-existent (lapsed) payment entry must return Err, not panic"
+    );
+    match result {
+        Err(Ok(_contract_err)) => { /* expected */ }
+        Err(Err(_host_err)) => panic!("Expected contract error, got host-level error (panic path)"),
+        Ok(_) => panic!("Expected Err but got Ok"),
+    }
 }

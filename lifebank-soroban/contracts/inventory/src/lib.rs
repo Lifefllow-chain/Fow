@@ -4,11 +4,13 @@
 mod error;
 mod events;
 mod storage;
+mod ttl;
 mod types;
 mod validation;
 
 use crate::error::ContractError;
 use crate::types::{is_valid_transition, BloodStatus, BloodType, BloodUnit, DataKey, Reservation, Role};
+use ttl::bump_instance;
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 
@@ -87,6 +89,7 @@ impl InventoryContract {
     /// # Errors
     /// - `AlreadyInitialized`: Contract has already been initialized
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        bump_instance(&env);
         admin.require_auth();
 
         // Check if already initialized
@@ -110,6 +113,7 @@ impl InventoryContract {
     /// Pause the contract. Only the admin can call this.
     /// All state-mutating functions will return `ContractPaused` while paused.
     pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        bump_instance(&env);
         admin.require_auth();
         let stored_admin = storage::get_admin(&env);
         if admin != stored_admin {
@@ -121,6 +125,7 @@ impl InventoryContract {
 
     /// Unpause the contract. Only the admin can call this.
     pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        bump_instance(&env);
         admin.require_auth();
         let stored_admin = storage::get_admin(&env);
         if admin != stored_admin {
@@ -132,6 +137,7 @@ impl InventoryContract {
 
     /// Returns whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
+        bump_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -261,6 +267,7 @@ impl InventoryContract {
         quantity_ml: u32,
         donor_id: Option<Address>,
     ) -> Result<u64, ContractError> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
 
         // Check contract is initialized
@@ -346,7 +353,9 @@ impl InventoryContract {
         blood_unit.validate(current_time)?;
 
         // Store blood unit — only reaches here if the ID slot was empty.
-        storage::set_blood_unit(&env, &blood_unit);
+        // Use set_blood_unit_new so the TTL is extended to at least the
+        // product-lifetime horizon (42-day shelf life + 30-day audit buffer).
+        storage::set_blood_unit_new(&env, &blood_unit);
 
         // Persist serial number → unit_id so duplicate registrations are rejected
         env.storage().persistent().set(&serial_key, &blood_unit_id);
@@ -385,6 +394,7 @@ impl InventoryContract {
     /// # Errors
     /// - `NotFound`: Blood unit with given ID doesn't exist
     pub fn get_blood_unit(env: Env, blood_unit_id: u64) -> Result<BloodUnit, ContractError> {
+        bump_instance(&env);
         storage::get_blood_unit(&env, blood_unit_id).ok_or(ContractError::NotFound)
     }
 
@@ -395,6 +405,7 @@ impl InventoryContract {
         authorized_by: Address,
         reason: Option<String>,
     ) -> Result<BloodUnit, ContractError> {
+        bump_instance(&env);
         authorized_by.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -525,6 +536,7 @@ impl InventoryContract {
         authorized_by: Address,
         reason: Option<String>,
     ) -> Result<u64, ContractError> {
+        bump_instance(&env);
         authorized_by.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -596,6 +608,7 @@ impl InventoryContract {
     }
 
     pub fn get_status_history(env: Env, unit_id: u64) -> Vec<crate::types::StatusChangeHistory> {
+        bump_instance(&env);
         storage::get_status_history(&env, unit_id)
     }
 
@@ -605,15 +618,18 @@ impl InventoryContract {
         unit_id: u64,
         page: u32,
     ) -> Vec<crate::types::StatusChangeHistory> {
+        bump_instance(&env);
         storage::get_status_history_page(&env, unit_id, page)
     }
 
     /// Return the last page number for a unit's history (0-based).
     pub fn get_history_page_count(env: Env, unit_id: u64) -> u32 {
+        bump_instance(&env);
         storage::get_history_page_count(&env, unit_id)
     }
 
     pub fn get_status_change_count(env: Env, unit_id: u64) -> u64 {
+        bump_instance(&env);
         storage::get_blood_unit_status_change_count(&env, unit_id)
     }
 
@@ -624,6 +640,7 @@ impl InventoryContract {
         bank_id: Address,
         entries: Vec<(String, BloodType, u32, Option<Address>)>,
     ) -> Result<Vec<u64>, ContractError> {
+        bump_instance(&env);
         bank_id.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -687,6 +704,7 @@ impl InventoryContract {
         request_id: u64,
         duration_seconds: u64,
     ) -> Result<u64, ContractError> {
+        bump_instance(&env);
         requester.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -793,6 +811,7 @@ impl InventoryContract {
     /// unit that transitions Reserved → Available, preserving the full audit trail.
     pub fn release_reservation(env: Env, caller: Address, reservation_id: u64) -> Result<(), ContractError> {
         caller.require_auth();
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         
         let reservation = storage::get_reservation(&env, reservation_id)
@@ -851,6 +870,7 @@ impl InventoryContract {
 
     /// Get a reservation by ID.
     pub fn get_reservation(env: Env, reservation_id: u64) -> Result<Reservation, ContractError> {
+        bump_instance(&env);
         storage::get_reservation(&env, reservation_id).ok_or(ContractError::ReservationNotFound)
     }
 
@@ -863,6 +883,7 @@ impl InventoryContract {
         requester: Address,
         batch: Vec<(Vec<u64>, u64, u64)>,
     ) -> Result<Vec<u64>, ContractError> {
+        bump_instance(&env);
         requester.require_auth();
 
         Self::require_not_paused(&env)?;
