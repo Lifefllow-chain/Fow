@@ -1925,8 +1925,8 @@ fn test_reserve_and_release_across_30_day_gap() {
 
     let uid = client.register_blood(&admin, &String::from_str(&env, "SN-TTL-F"), &BloodType::OPositive, &450u32, &None);
 
-    // Reserve with a 60-day window.
-    let duration = 60 * 24 * 3600u64;
+    // Reserve with the maximum allowed window (7 days).
+    let duration = 7 * 24 * 3600u64;
     let res_id = client.reserve_blood(
         &admin,
         &soroban_sdk::vec![&env, uid],

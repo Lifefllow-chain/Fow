@@ -7,6 +7,9 @@ use soroban_sdk::{Address, Env, String, Vec};
 pub const SECONDS_PER_DAY: u64 = 86400;
 pub const BLOOD_SHELF_LIFE_DAYS: u64 = 35;
 
+pub const TTL_THRESHOLD: u32 = crate::ttl::INDEX_TTL_THRESHOLD;
+pub const TTL_EXTEND_TO: u32 = crate::ttl::INDEX_EXTEND_TO;
+
 /// Maximum history entries per storage page. Keeps each page small so
 /// a single read never loads the entire history of a high-traffic unit.
 const HISTORY_PAGE_SIZE: u32 = 50;
@@ -26,9 +29,21 @@ pub fn set_admin(env: &Env, admin: &Address) {
 
 // ── Authorization ──────────────────────────────────────────────────────────────
 
+pub fn set_authorized_bank(env: &Env, bank: &Address, authorized: bool) {
+    let key = DataKey::AuthorizedBank(bank.clone());
+    env.storage().persistent().set(&key, &authorized);
+    bump_index(env, &key);
+}
+
 pub fn is_authorized_bank(env: &Env, bank: &Address) -> bool {
     let admin = get_admin(env);
-    bank == &admin
+    if bank == &admin {
+        return true;
+    }
+    env.storage()
+        .persistent()
+        .get(&DataKey::AuthorizedBank(bank.clone()))
+        .unwrap_or(false)
 }
 
 // ── Blood unit counter ─────────────────────────────────────────────────────────

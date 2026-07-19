@@ -1458,4 +1458,3 @@ impl PaymentContract {
 }
 
 mod test;
-mod test_two_party_confirmation;

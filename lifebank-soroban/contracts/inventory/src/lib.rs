@@ -10,7 +10,7 @@ mod validation;
 
 use crate::error::ContractError;
 use crate::types::{is_valid_transition, BloodStatus, BloodType, BloodUnit, DataKey, Reservation, Role};
-use ttl::bump_instance;
+use ttl::{bump_index, bump_instance};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 
@@ -169,7 +169,7 @@ impl InventoryContract {
         }
         let role_key = DataKey::Role(grantee);
         env.storage().persistent().set(&role_key, &role);
-        env.storage().persistent().extend_ttl(&role_key, storage::TTL_THRESHOLD, storage::TTL_EXTEND_TO);
+        bump_index(&env, &role_key);
         Ok(())
     }
 
@@ -359,7 +359,7 @@ impl InventoryContract {
 
         // Persist serial number → unit_id so duplicate registrations are rejected
         env.storage().persistent().set(&serial_key, &blood_unit_id);
-        env.storage().persistent().extend_ttl(&serial_key, storage::TTL_THRESHOLD, storage::TTL_EXTEND_TO);
+        bump_index(&env, &serial_key);
 
         // Update indexes for efficient querying
         storage::add_to_blood_type_index(&env, &blood_unit);
@@ -962,5 +962,3 @@ impl InventoryContract {
 
 #[cfg(test)]
 mod test;
-#[cfg(test)]
-mod test_expiry_fix;

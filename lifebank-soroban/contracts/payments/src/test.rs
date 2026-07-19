@@ -210,10 +210,10 @@ fn test_get_payment_by_request_resolves_without_full_scan() {
 #[test]
 fn test_terminal_payment_does_not_block_new_active_payment_for_different_request() {
     // Payments for distinct request IDs must never interfere.
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let (id1, payer1, _) = make_payment(&env, &client, 100, 200);
-    client.update_status(&id1, &PaymentStatus::Refunded, &payer1);
+    let (id1, _, _) = make_payment(&env, &client, 100, 200);
+    client.update_status(&id1, &PaymentStatus::Refunded, &admin);
 
     // A payment for a different request must still be accepted.
     let (id2, _, _) = make_payment(&env, &client, 101, 300);
@@ -313,14 +313,14 @@ fn test_get_payments_by_payee_pagination() {
 
 #[test]
 fn test_get_payments_by_status_filters_correctly() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let (id1, payer1, _) = make_payment(&env, &client, 1, 100);
-    let (id2, payer2, _) = make_payment(&env, &client, 2, 200);
+    let (id1, _, _) = make_payment(&env, &client, 1, 100);
+    let (id2, _, _) = make_payment(&env, &client, 2, 200);
     make_payment(&env, &client, 3, 300);
 
-    client.update_status(&id1, &PaymentStatus::Locked, &payer1);
-    client.update_status(&id2, &PaymentStatus::Locked, &payer2);
+    client.update_status(&id1, &PaymentStatus::Locked, &admin);
+    client.update_status(&id2, &PaymentStatus::Locked, &admin);
 
     let locked = client.get_payments_by_status(&PaymentStatus::Locked, &0u32, &20u32);
     assert_eq!(locked.items.len(), 2);
@@ -342,11 +342,11 @@ fn test_get_payments_by_status_empty_when_none_match() {
 
 #[test]
 fn test_get_payments_by_status_pagination() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
     for i in 1u64..=5 {
-        let (id, payer, _) = make_payment(&env, &client, i, 100);
-        client.update_status(&id, &PaymentStatus::Refunded, &payer);
+        let (id, _, _) = make_payment(&env, &client, i, 100);
+        client.update_status(&id, &PaymentStatus::Refunded, &admin);
     }
 
     let page0 = client.get_payments_by_status(&PaymentStatus::Refunded, &0u32, &3u32);
@@ -374,19 +374,19 @@ fn test_statistics_empty_when_no_payments() {
 
 #[test]
 fn test_statistics_counts_and_totals_correctly() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
 
-    let (id1, payer1, _) = make_payment(&env, &client, 1, 1000);
-    let (id2, payer2, _) = make_payment(&env, &client, 2, 2000);
-    let (id3, payer3, _) = make_payment(&env, &client, 3, 500);
-    let (id4, payer4, _) = make_payment(&env, &client, 4, 750);
+    let (id1, _, _) = make_payment(&env, &client, 1, 1000);
+    let (id2, _, _) = make_payment(&env, &client, 2, 2000);
+    let (id3, _, _) = make_payment(&env, &client, 3, 500);
+    let (id4, _, _) = make_payment(&env, &client, 4, 750);
     make_payment(&env, &client, 5, 300); // stays Pending
 
-    client.update_status(&id1, &PaymentStatus::Locked, &payer1);
-    client.update_status(&id2, &PaymentStatus::Locked, &payer2);
-    client.update_status(&id3, &PaymentStatus::Released, &payer3);
-    client.update_status(&id4, &PaymentStatus::Refunded, &payer4);
+    client.update_status(&id1, &PaymentStatus::Locked, &admin);
+    client.update_status(&id2, &PaymentStatus::Locked, &admin);
+    client.update_status(&id3, &PaymentStatus::Released, &admin);
+    client.update_status(&id4, &PaymentStatus::Refunded, &admin);
 
     let stats = client.get_payment_statistics();
     assert_eq!(stats.count_locked, 2);
@@ -399,14 +399,14 @@ fn test_statistics_counts_and_totals_correctly() {
 
 #[test]
 fn test_statistics_ignores_pending_cancelled_disputed() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let (id1, payer1, _) = make_payment(&env, &client, 1, 100);
-    let (id2, payer2, _) = make_payment(&env, &client, 2, 200);
+    let (id1, _, _) = make_payment(&env, &client, 1, 100);
+    let (id2, _, _) = make_payment(&env, &client, 2, 200);
     make_payment(&env, &client, 3, 300); // stays Pending
 
-    client.update_status(&id1, &PaymentStatus::Cancelled, &payer1);
-    client.update_status(&id2, &PaymentStatus::Disputed, &payer2);
+    client.update_status(&id1, &PaymentStatus::Cancelled, &admin);
+    client.update_status(&id2, &PaymentStatus::Disputed, &admin);
 
     let stats = client.get_payment_statistics();
     assert_eq!(stats.count_locked, 0);
@@ -476,15 +476,15 @@ fn test_timeline_unknown_request_returns_empty() {
 
 #[test]
 fn test_update_status_changes_payment_status() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let (id, payer, _) = make_payment(&env, &client, 1, 500);
+    let (id, _, _) = make_payment(&env, &client, 1, 500);
 
-    client.update_status(&id, &PaymentStatus::Locked, &payer);
+    client.update_status(&id, &PaymentStatus::Locked, &admin);
     let p = client.get_payment(&id);
     assert_eq!(p.status, PaymentStatus::Locked);
 
-    client.update_status(&id, &PaymentStatus::Released, &payer);
+    client.update_status(&id, &PaymentStatus::Released, &admin);
     let p = client.get_payment(&id);
     assert_eq!(p.status, PaymentStatus::Released);
 }
@@ -893,7 +893,7 @@ fn test_create_escrow_transfers_tokens_to_contract() {
     assert_eq!(token_client.balance(&cid), 3_000, "Contract should hold the escrowed 3000 tokens");
 }
 
-/// release_escrow transfers the locked amount from the contract to the payee.
+/// release_escrow + confirm_receipt transfers the locked amount from the contract to the payee.
 #[test]
 fn test_release_escrow_transfers_tokens_to_payee() {
     let (env, cid) = setup();
@@ -911,7 +911,9 @@ fn test_release_escrow_transfers_tokens_to_payee() {
     assert_eq!(token_client.balance(&cid), 2_000);
     assert_eq!(token_client.balance(&payee), 0);
 
+    // Two-party confirmation: coordinator first, then hospital.
     client.release_escrow(&admin, &payment_id);
+    client.confirm_receipt(&payment_id, &hospital);
 
     assert_eq!(token_client.balance(&cid), 0, "Contract should have no tokens after release");
     assert_eq!(token_client.balance(&payee), 2_000, "Payee should receive the escrowed tokens");
