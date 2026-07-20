@@ -24,7 +24,7 @@ pub use lifebank_interfaces::{
 };
 use lifebank_interfaces::clients::{InventoryContractClient, PaymentContractClient, RequestContractClient};
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
 const ALLOCATION_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
