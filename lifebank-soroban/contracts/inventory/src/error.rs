@@ -51,4 +51,10 @@ pub enum ContractError {
     // Cross-contract synchronisation (180-189)
     RegistryNotConfigured = 180,
     RegistryCallFailed = 181,
+
+    // TTL / storage lifecycle errors (190)
+    /// A persistent storage entry has passed its policy horizon and been
+    /// archived or has lapsed.  Callers should treat this as a distinct,
+    /// documented failure rather than a host-level panic.
+    EntryExpired = 190,
 }
