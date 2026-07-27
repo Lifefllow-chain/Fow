@@ -18,9 +18,10 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "test:contracts": "jest --testPathPatterns=\"__contracts__\" --detectOpenHandles --forceExit",
-    "test:contracts:watch": "jest --testPathPatterns=\"__contracts__\" --watch",
-    "test:contracts:cov": "jest --testPathPatterns=\"__contracts__\" --coverage --detectOpenHandles --forceExit",
+    "generate:soroban-types": "ts-node scripts/generate-soroban-types.ts --spec-dir ../lifebank-soroban/spec-snapshots --out src/__contracts__/soroban-types.gen.ts",
+    "test:contracts": "jest --testPathPatterns='__contracts__' --detectOpenHandles --forceExit",
+    "test:contracts:watch": "jest --testPathPatterns='__contracts__' --watch",
+    "test:contracts:cov": "jest --testPathPatterns='__contracts__' --coverage --detectOpenHandles --forceExit",
     "test:integration": "jest --config ./test/jest-integration.json",
     "prepare": "cd .. && husky backend/.husky",
     "seed": "ts-node -r tsconfig-paths/register src/scripts/seed.ts"

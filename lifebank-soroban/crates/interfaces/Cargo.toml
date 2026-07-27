@@ -1,0 +1,20 @@
+[package]
+name = "lifebank-interfaces"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared cross-contract types and client traits for the Lifebank Soroban workspace"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+# Enable contractclient code generation (required when building callers, not the implementing contracts)
+client = []

@@ -9,29 +9,21 @@ mod test;
 
 pub use error::MatchingError;
 pub use matching::{compatible_donor_types, is_compatible, score_unit, select_units, sort_by_expiration};
-pub use types::{
-    BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, DataKey, MatchKind,
-    MatchResult, MatchedUnit, RequestStatus, Urgency,
+pub use types::{DataKey, MatchKind, MatchResult, MatchedUnit};
+
+// Shared cross-contract types — single source of truth from the interfaces crate.
+pub use lifebank_interfaces::{
+    BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, RequestStatus, Urgency,
 };
 
 use soroban_sdk::{contract, contractclient, contractimpl, Address, Env, Vec};
 
 // ---------------------------------------------------------------------------
-// Cross-contract client interfaces
+// Cross-contract client interfaces (generated from shared trait definitions)
 // ---------------------------------------------------------------------------
 
-/// Minimal interface we need from the inventory contract.
-#[contractclient(name = "InventoryContractClient")]
-pub trait InventoryContractInterface {
-    fn get_blood_unit(env: Env, blood_unit_id: u64) -> BloodUnit;
-    fn get_units_by_blood_type(env: Env, blood_type: BloodType) -> Vec<u64>;
-}
-
-/// Minimal interface we need from the requests contract.
-#[contractclient(name = "RequestsContractClient")]
-pub trait RequestsContractInterface {
-    fn get_request(env: Env, request_id: u64) -> BloodRequest;
-}
+// Use the shared client structs generated from the interface crate's trait definitions.
+use lifebank_interfaces::clients::{InventoryContractClient, RequestContractClient};
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -166,7 +158,7 @@ impl MatchingContract {
             .instance()
             .get(&DataKey::RequestsContract)
             .unwrap();
-        let req_client = RequestsContractClient::new(&env, &req_addr);
+        let req_client = RequestContractClient::new(&env, &req_addr);
         let request = req_client
             .try_get_request(&request_id)
             .map_err(|_| MatchingError::RequestNotFound)?
@@ -254,7 +246,7 @@ impl MatchingContract {
             .instance()
             .get(&DataKey::RequestsContract)
             .unwrap();
-        let req_client = RequestsContractClient::new(&env, &req_addr);
+        let req_client = RequestContractClient::new(&env, &req_addr);
 
         // Load all requests in one pass
         let mut requests: Vec<BloodRequest> = Vec::new(&env);

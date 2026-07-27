@@ -10,7 +10,8 @@
 ///   return whatever we found rather than failing.
 use soroban_sdk::{Env, Vec};
 
-use crate::types::{BloodStatus, BloodType, BloodUnit, MatchKind, MatchedUnit, Urgency};
+use crate::types::{MatchKind, MatchedUnit};
+use lifebank_interfaces::{BloodStatus, BloodType, BloodUnit, Urgency};
 
 // ---------------------------------------------------------------------------
 // ABO / Rh compatibility
