@@ -68,7 +68,7 @@ export default function Home() {
       <section id="problem" className="mx-auto max-w-[1288px] px-6 py-24 md:py-32">
         <div className="grid gap-14 lg:grid-cols-[0.9fr_1.1fr]">
           <div data-animate="left">
-            <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700">
+            <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700 dark:text-oxblood-400">
               The problem
             </p>
             <h2 className="mt-3 font-manrope text-[34px] font-bold leading-tight text-text-primary md:text-[42px]">
@@ -87,7 +87,7 @@ export default function Home() {
                 key={p}
                 className="rounded-xl border border-border-muted bg-surface p-5 font-roboto text-[14.5px] leading-relaxed text-text-secondary shadow-card"
               >
-                <span className="mb-3 block font-manrope text-lg text-oxblood-600">&#10007;</span>
+                <span className="mb-3 block font-manrope text-lg text-oxblood-600 dark:text-oxblood-400">&#10007;</span>
                 {p}
               </li>
             ))}
@@ -140,7 +140,7 @@ export default function Home() {
       {/* how it works — vein to vein */}
       <section id="how" className="mx-auto max-w-[1288px] px-6 py-24 md:py-32">
         <div className="max-w-2xl" data-animate="up">
-          <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700">
+          <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700 dark:text-oxblood-400">
             How SmartBag works
           </p>
           <h2 className="mt-3 font-manrope text-[34px] font-bold leading-tight text-text-primary md:text-[42px]">
@@ -164,7 +164,7 @@ export default function Home() {
                   <span className="hidden h-px flex-1 bg-gradient-to-r from-oxblood-400 to-transparent md:block" />
                 )}
               </div>
-              <span className="mt-4 flex h-9 w-9 items-center justify-center rounded-lg bg-oxblood-50 text-oxblood-700">
+              <span className="mt-4 flex h-9 w-9 items-center justify-center rounded-lg bg-oxblood-50 text-oxblood-700 dark:bg-oxblood-950 dark:text-oxblood-300">
                 <s.icon size={18} strokeWidth={1.75} />
               </span>
               <h3 className="mt-3 font-manrope text-[16px] font-bold text-text-primary">
@@ -199,7 +199,7 @@ export default function Home() {
       <section id="access" className="bg-surface-raised/60 py-24 md:py-28">
         <div className="mx-auto grid max-w-[1288px] items-center gap-14 px-6 lg:grid-cols-2">
           <div data-animate="left">
-            <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700">
+            <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700 dark:text-oxblood-400">
               Built for the Nigerian landscape
             </p>
             <h2 className="mt-3 font-manrope text-[32px] font-bold leading-tight text-text-primary md:text-[40px]">
@@ -217,7 +217,7 @@ export default function Home() {
             data-animate="right"
           >
             <div className="flex items-center gap-3 border-b border-border-muted pb-4">
-              <Phone size={18} className="text-oxblood-700" />
+              <Phone size={18} className="text-oxblood-700 dark:text-oxblood-300" />
               <span className="font-manrope text-sm font-bold text-text-primary">
                 USSD session
               </span>
@@ -240,7 +240,7 @@ Status: SAFE TO TRANSFUSE`}
       {/* impact */}
       <section id="impact" className="mx-auto max-w-[1288px] px-6 py-24 md:py-32">
         <div className="max-w-2xl" data-animate="up">
-          <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700">
+          <p className="font-poppins text-[13px] font-semibold uppercase tracking-wider text-oxblood-700 dark:text-oxblood-400">
             Impact
           </p>
           <h2 className="mt-3 font-manrope text-[34px] font-bold leading-tight text-text-primary md:text-[42px]">

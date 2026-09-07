@@ -1,11 +1,11 @@
 {
-  "name": "Health Chain",
-  "short_name": "HealthChain",
-  "description": "Transparent healthcare donation platform",
+  "name": "Lifeflow-chain Protocol",
+  "short_name": "Lifeflow-chain",
+  "description": "Tamper-proof, vein-to-vein blood traceability on Stellar Soroban.",
   "start_url": "/dashboard",
   "display": "standalone",
-  "background_color": "#F5F7FA",
-  "theme_color": "#B32346",
+  "background_color": "#2a0708",
+  "theme_color": "#420e10",
   "orientation": "portrait-primary",
   "icons": [
     {

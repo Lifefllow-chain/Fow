@@ -132,10 +132,10 @@ const SignInPage: React.FC<SignInPageProps> = ({
             </div>
           </div>
           <h1 className="text-3xl font-bold mb-4 leading-tight">
-            Welcome to Healthy Stellar
+            Welcome to Lifeflow&#8288;-&#8288;chain
           </h1>
           <p className="text-lg opacity-90 leading-relaxed">
-            Your trusted platform for blood donation management and healthcare services.
+            Tamper-proof, vein-to-vein traceability for every unit of blood &mdash; on Stellar Soroban.
           </p>
         </div>
       </div>

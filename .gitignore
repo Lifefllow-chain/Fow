@@ -20,3 +20,5 @@ build/
 !task.md
 !tasks.md
 !design.md
+.claude/settings.local.json
+.vercel

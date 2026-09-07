@@ -73,10 +73,10 @@ export default function Navbar() {
               <Link
                 key={l.href}
                 href={l.href}
-                className="group relative py-1.5 hover:text-oxblood-700 transition-colors"
+                className="group relative py-1.5 hover:text-oxblood-700 dark:hover:text-oxblood-300 transition-colors"
               >
                 {l.label}
-                <span className="absolute left-0 -bottom-0.5 h-[2px] w-0 bg-oxblood-700 group-hover:w-full transition-all duration-300" />
+                <span className="absolute left-0 -bottom-0.5 h-[2px] w-0 bg-oxblood-700 dark:bg-oxblood-400 group-hover:w-full transition-all duration-300" />
               </Link>
             ))}
           </div>
