@@ -68,7 +68,7 @@ export default function Hero() {
       <div className="relative z-10 mx-auto grid max-w-[1288px] grid-cols-1 items-center gap-16 px-6 lg:grid-cols-[1.05fr_0.95fr]">
         {/* Left: copy */}
         <div>
-          <span className="hero-eyebrow inline-flex items-center gap-2 rounded-full border border-oxblood-200 bg-oxblood-50 px-4 py-1.5 font-poppins text-[13px] font-medium text-oxblood-700 dark:border-oxblood-800 dark:bg-oxblood-950">
+          <span className="hero-eyebrow inline-flex items-center gap-2 rounded-full border border-oxblood-200 bg-oxblood-50 px-4 py-1.5 font-poppins text-[13px] font-medium text-oxblood-700 dark:border-oxblood-800 dark:bg-oxblood-950 dark:text-oxblood-300">
             <span className="relative flex h-2 w-2">
               <span className="absolute inline-flex h-full w-full animate-pulse-ring rounded-full bg-oxblood-500" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-oxblood-600" />

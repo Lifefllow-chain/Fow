@@ -1,6 +1,6 @@
 import Link from 'next/link';
 
-export const metadata = { title: '403 Forbidden | Health Chain' };
+export const metadata = { title: '403 Forbidden | Lifeflow-chain Protocol' };
 
 export default function ForbiddenPage() {
   return (

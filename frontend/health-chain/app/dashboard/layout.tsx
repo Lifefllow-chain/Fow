@@ -78,7 +78,7 @@ export default function DashboardLayout({
         {/* Logo Area */}
         <div className="pt-[30px] 2xl:pt-[39px] pl-[30px] 2xl:pl-[48px] pr-[15px] flex items-center gap-[10px] mb-[40px] 2xl:mb-[60px]">
            <div className="w-[50px] h-[50px] 2xl:w-[61px] 2xl:h-[62px] rounded-full bg-white shadow-[0px_4px_10px_rgba(0,0,0,0.1)] flex items-center justify-center">
-             <Image src="/logo-drop.svg" alt="Health Chain" width={30} height={36} className="w-[24px] h-[28px] 2xl:w-[30px] 2xl:h-[36.3px]" />
+             <Image src="/logo-drop.svg" alt="Lifeflow-chain" width={30} height={36} className="w-[24px] h-[28px] 2xl:w-[30px] 2xl:h-[36.3px]" />
            </div>
            <button
              onClick={() => setIsMobileMenuOpen(false)}

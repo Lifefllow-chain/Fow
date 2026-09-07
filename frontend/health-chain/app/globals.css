@@ -26,12 +26,12 @@
 
 /* ── Dark theme ── */
 .dark {
-  --bg-surface: #1a0709;
-  --bg-surface-raised: #2a0b0d;
+  --bg-surface: #160607;
+  --bg-surface-raised: #241012;
   --text-primary: #fbeeee;
   --text-secondary: #e6c9c9;
   --text-muted: #b98f90;
-  --border-muted: #45191b;
+  --border-muted: #54211f;
   --status-info: #df9091;
   --status-warning: #e0b26a;
   --status-critical: #cf6062;
@@ -113,7 +113,7 @@ html:not(.gsap-ready) [data-animate] {
   width: 10px;
 }
 ::-webkit-scrollbar-track {
-  background: #fbf1f1;
+  background: var(--bg-surface-raised);
 }
 ::-webkit-scrollbar-thumb {
   background: #7d1f22;
@@ -121,6 +121,12 @@ html:not(.gsap-ready) [data-animate] {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #420e10;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #9c2b2e;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #cf6062;
 }
 
 /* Ensure smooth scrolling */
