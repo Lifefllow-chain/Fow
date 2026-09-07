@@ -16,6 +16,7 @@ import {
   LogOut, 
   Menu,
   X,
+  Navigation,
   Package,
   ShieldAlert,
   Upload,
@@ -140,18 +141,17 @@ export default function DashboardLayout({
 
       {/* --- MAIN CONTENT --- */}
       <main id="main-content" tabIndex={-1} className="flex-1 w-full min-w-0 p-4 md:p-8 xl:pt-[60px] xl:px-[40px] overflow-hidden">
-        {/* Mobile Toggle */}
-        <div className="xl:hidden flex items-center justify-between mb-6">
-            <button
-              onClick={() => setIsMobileMenuOpen(true)}
-              aria-label="Open navigation menu"
-              aria-expanded={isMobileMenuOpen}
-              aria-controls="sidebar-nav"
-              className="focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 rounded"
-            >
-                <Menu className="w-8 h-8 text-gray-700" aria-hidden="true" />
-            </button>
-          </div>
+        {/* Top bar: mobile menu toggle + header actions */}
+        <div className="flex items-center justify-between mb-6">
+          <button
+            onClick={() => setIsMobileMenuOpen(true)}
+            aria-label="Open navigation menu"
+            aria-expanded={isMobileMenuOpen}
+            aria-controls="sidebar-nav"
+            className="xl:hidden focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 rounded"
+          >
+            <Menu className="w-8 h-8 text-gray-700" aria-hidden="true" />
+          </button>
           <div className="flex items-center gap-3 ml-auto">
             <ConnectionStatusPill />
             <NotificationBell />

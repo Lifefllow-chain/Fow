@@ -6,8 +6,15 @@ import { LoadingSpinner } from "./LoadingSpinner";
 
 export interface ButtonProps
   extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "primary" | "secondary" | "destructive" | "ghost";
-  size?: "sm" | "md" | "lg";
+  // "default"/"outline" are shadcn-style aliases used by some admin pages.
+  variant?:
+    | "primary"
+    | "secondary"
+    | "destructive"
+    | "ghost"
+    | "default"
+    | "outline";
+  size?: "sm" | "md" | "lg" | "icon";
   loading?: boolean;
 }
 
@@ -30,8 +37,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     const variants = {
       primary:
         "bg-[#D32F2F] text-white hover:bg-[#b71c1c] focus-visible:ring-[#D32F2F] dark:bg-[#ef5350] dark:hover:bg-[#D32F2F]",
+      default:
+        "bg-[#D32F2F] text-white hover:bg-[#b71c1c] focus-visible:ring-[#D32F2F] dark:bg-[#ef5350] dark:hover:bg-[#D32F2F]",
       secondary:
         "bg-white text-brand-black border border-gray-300 hover:bg-gray-50 focus-visible:ring-gray-400 dark:bg-surface dark:text-text-primary dark:border-border-muted dark:hover:bg-surface-raised",
+      outline:
+        "bg-transparent text-text-primary border border-border-muted hover:bg-surface-raised focus-visible:ring-gray-400",
       destructive:
         "bg-red-700 text-white hover:bg-red-800 focus-visible:ring-red-600",
       ghost:
@@ -42,6 +53,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       sm: "px-3 py-1.5 text-sm h-8",
       md: "px-4 py-2 text-base h-10",
       lg: "px-6 py-3 text-lg h-12",
+      icon: "h-10 w-10",
     };
 
     return (

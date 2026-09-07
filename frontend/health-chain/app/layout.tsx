@@ -6,6 +6,8 @@ import { ToastProvider } from "../components/providers/ToastProvider";
 import { ReactQueryProvider } from "../components/providers/ReactQueryProvider";
 import { I18nProvider } from "../components/providers/I18nProvider";
 import { WalletProvider } from "../components/providers/WalletProvider";
+import MotionProvider from "../components/motion/MotionProvider";
+import { Toaster } from "sonner";
 import NetworkMismatchBanner from "../components/blockchain/NetworkMismatchBanner";
 import { SkipLink } from "../components/accessibility/AccessibleComponents";
 import { OfflineBanner } from "../components/ui/OfflineBanner";
@@ -35,8 +37,9 @@ const dmSans = DM_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "Health Chain",
-  description: "Transparent healthcare donation platform",
+  title: "Lifeflow-chain Protocol — Vein-to-vein blood traceability",
+  description:
+    "An open-source protocol on Stellar Soroban for tamper-proof blood chain-of-custody, transparent health donations, and immutable healthcare supply-chain tracking.",
   manifest: "/manifest.json",
 };
 
@@ -49,7 +52,7 @@ export default function RootLayout({
     <html lang="en">
       <head>
         <link rel="manifest" href="/manifest.json" />
-        <meta name="theme-color" content="#B32346" />
+        <meta name="theme-color" content="#420e10" />
       </head>
       <body
         className={`${poppins.variable} ${roboto.variable} ${manrope.variable} ${dmSans.variable} antialiased bg-surface text-text-primary`}
@@ -60,8 +63,11 @@ export default function RootLayout({
             <ReactQueryProvider>
               <WalletProvider>
                 <OfflineBanner />
-                <ToastProvider>{children}</ToastProvider>
+                <ToastProvider>
+                  <MotionProvider>{children}</MotionProvider>
+                </ToastProvider>
                 <NetworkMismatchBanner />
+                <Toaster position="top-right" richColors />
               </WalletProvider>
             </ReactQueryProvider>
           </I18nProvider>
