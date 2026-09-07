@@ -7,7 +7,10 @@ export type BadgeVariant =
   | "critical"
   | "resolved"
   | "info"
-  | "default";
+  | "default"
+  // shadcn-style aliases used by some admin pages
+  | "secondary"
+  | "outline";
 
 export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
   variant?: BadgeVariant;
@@ -24,6 +27,10 @@ const variantStyles: Record<BadgeVariant, string> = {
   info: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-300",
   default:
     "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300",
+  secondary:
+    "bg-oxblood-50 text-oxblood-800 dark:bg-oxblood-950 dark:text-oxblood-200",
+  outline:
+    "border border-border-muted text-text-primary bg-transparent",
 };
 
 export const Badge = forwardRef<HTMLSpanElement, BadgeProps>(
