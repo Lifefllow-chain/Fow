@@ -3,7 +3,7 @@ import { fetchPublicMetrics } from '../../lib/api/transparency.api';
 import TransparencyDashboard from './TransparencyDashboard';
 
 export const metadata = {
-  title: 'Network Transparency | Health Chain',
+  title: 'Network Transparency | Lifeflow-chain Protocol',
   description:
     'Aggregate network impact metrics — fulfilled requests, donations, verified partners, and geographic coverage.',
 };
@@ -19,14 +19,14 @@ export default async function TransparencyPage() {
   }
 
   return (
-    <main className="min-h-screen bg-white">
+    <main className="min-h-screen bg-surface">
       <header className="bg-brand-footer text-white py-12 px-6">
         <div className="max-w-5xl mx-auto">
           <h1 className="font-manrope font-bold text-3xl md:text-4xl mb-3">
             Network Transparency Portal
           </h1>
           <p className="font-roboto text-gray-300 text-base max-w-2xl">
-            Aggregate impact data for the Health Chain network. All figures are
+            Aggregate impact data for the Lifeflow-chain network. All figures are
             derived from anonymised, non-personally-identifiable records. No
             patient, donor, or partner operational detail is exposed here.
           </p>

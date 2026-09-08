@@ -17,7 +17,7 @@ export default function TrackPage() {
       <section className="relative overflow-hidden pt-32 pb-14 md:pt-40">
         <div className="pointer-events-none absolute inset-0 bg-oxblood-radial" />
         <div className="relative mx-auto max-w-3xl px-6 text-center">
-          <span className="inline-flex items-center gap-2 rounded-full border border-oxblood-200 bg-oxblood-50 px-4 py-1.5 font-poppins text-[13px] font-medium text-oxblood-700 dark:border-oxblood-800 dark:bg-oxblood-950">
+          <span className="inline-flex items-center gap-2 rounded-full border border-oxblood-200 bg-oxblood-50 px-4 py-1.5 font-poppins text-[13px] font-medium text-oxblood-700 dark:border-oxblood-800 dark:bg-oxblood-950 dark:text-oxblood-300">
             Vein-to-vein lookup
           </span>
           <h1 className="mt-5 font-manrope text-[36px] font-bold leading-tight text-text-primary md:text-[48px]">

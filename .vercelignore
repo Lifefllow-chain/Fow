@@ -1,0 +1,14 @@
+# Only frontend/health-chain is built (Root Directory). Keep the upload lean.
+backend
+lifebank-soroban
+legacy
+scripts
+docs
+.github
+.kiro
+.vscode
+**/target
+**/.next
+**/node_modules
+*.md
+docker-compose.yml

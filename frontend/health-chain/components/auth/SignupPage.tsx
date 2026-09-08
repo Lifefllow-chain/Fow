@@ -112,7 +112,7 @@ const SignupPage: React.FC<SignupPageProps> = ({ onUserTypeSelect, onSignInClick
             </div>
           </div>
           <h1 className="text-3xl font-bold mb-4 leading-tight">
-            Join Healthy Stellar
+            Join Lifeflow&#8288;-&#8288;chain
           </h1>
           <p className="text-lg opacity-90 leading-relaxed">
             Create your account and start making a difference in healthcare today.

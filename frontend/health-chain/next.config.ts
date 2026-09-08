@@ -8,15 +8,13 @@ const nextConfig: NextConfig = {
     root: path.join(__dirname),
   },
 
-  // NOTE: pre-existing type/lint debt lives across the admin, transparency and
+  // NOTE: pre-existing type debt lives across the admin, transparency and
   // realtime modules (recharts + socket.io + leaflet type mismatches, test
   // helpers, etc.) that predate this work. It does not affect the runtime
   // bundle. Unblock deploys now; pay it down separately.
+  // (Next 16 no longer runs ESLint during `next build`, so no eslint key.)
   typescript: {
     ignoreBuildErrors: true,
-  },
-  eslint: {
-    ignoreDuringBuilds: true,
   },
 };
 

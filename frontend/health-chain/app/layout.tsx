@@ -7,6 +7,7 @@ import { ReactQueryProvider } from "../components/providers/ReactQueryProvider";
 import { I18nProvider } from "../components/providers/I18nProvider";
 import { WalletProvider } from "../components/providers/WalletProvider";
 import MotionProvider from "../components/motion/MotionProvider";
+import { ThemeProvider } from "../components/providers/ThemeProvider";
 import { Toaster } from "sonner";
 import NetworkMismatchBanner from "../components/blockchain/NetworkMismatchBanner";
 import { SkipLink } from "../components/accessibility/AccessibleComponents";
@@ -49,28 +50,36 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         <link rel="manifest" href="/manifest.json" />
         <meta name="theme-color" content="#420e10" />
+        {/* Apply the saved theme before first paint to avoid a flash. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var t=localStorage.getItem('theme')||'system';var d=t==='dark'||(t!=='light'&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d);document.documentElement.style.colorScheme=d?'dark':'light';}catch(e){}})();`,
+          }}
+        />
       </head>
       <body
         className={`${poppins.variable} ${roboto.variable} ${manrope.variable} ${dmSans.variable} antialiased bg-surface text-text-primary`}
       >
         <SkipLink href="#main-content" />
         <Suspense fallback={null}>
-          <I18nProvider>
-            <ReactQueryProvider>
-              <WalletProvider>
-                <OfflineBanner />
-                <ToastProvider>
-                  <MotionProvider>{children}</MotionProvider>
-                </ToastProvider>
-                <NetworkMismatchBanner />
-                <Toaster position="top-right" richColors />
-              </WalletProvider>
-            </ReactQueryProvider>
-          </I18nProvider>
+          <ThemeProvider>
+            <I18nProvider>
+              <ReactQueryProvider>
+                <WalletProvider>
+                  <OfflineBanner />
+                  <ToastProvider>
+                    <MotionProvider>{children}</MotionProvider>
+                  </ToastProvider>
+                  <NetworkMismatchBanner />
+                  <Toaster position="top-right" richColors theme="system" />
+                </WalletProvider>
+              </ReactQueryProvider>
+            </I18nProvider>
+          </ThemeProvider>
         </Suspense>
       </body>
     </html>
