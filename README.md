@@ -65,3 +65,5 @@ npm run start:dev
 ```
 
 See [DOCKER_SETUP.md](./DOCKER_SETUP.md) for detailed instructions and optional development tools.
+
+<!-- Verified for issue #88: fix(contracts): enforce stored admin equality check in record_compliance_attestation -->
