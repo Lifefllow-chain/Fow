@@ -1,52 +1,10 @@
-use soroban_sdk::{contracttype, Vec};
+use soroban_sdk::contracttype;
 
-/// Canonical workflow states — shared identifier across all contracts.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorkflowStatus {
-    /// Initial state before allocate_units is called.
-    Pending,
-    /// Units reserved, request approved.
-    Allocated,
-    /// All units delivered to hospital.
-    Delivered,
-    /// Payment released to blood bank.
-    Settled,
-    /// Workflow rolled back; units released, payment refunded.
-    RolledBack,
-    /// Workflow expired after allocation deadline; units released, payment refunded.
-    Expired,
-}
+// Cross-contract types live in the shared `interfaces` crate — one definition,
+// compiler-enforced. Do not re-declare them here.
+pub use interfaces::types::{ExcursionSummary, WorkflowRecord, WorkflowStatus};
 
-/// Per-request workflow record stored in the coordinator.
-/// This is the canonical cross-contract state reference.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct WorkflowRecord {
-    /// Stable identifier shared across all contracts.
-    pub request_id: u64,
-    /// Payment record ID in the payment contract.
-    pub payment_id: u64,
-    /// Inventory unit IDs allocated to this request.
-    pub unit_ids: Vec<u64>,
-    pub status: WorkflowStatus,
-    pub delivery_confirmed: bool,
-    /// ID of the inventory contract's `Reservation` record backing this
-    /// allocation — the single source of truth for which units are held and
-    /// until when (via `InventoryContractClient::get_reservation`).
-    pub reservation_id: u64,
-}
-
-/// Summary of a sustained temperature excursion (mirrors temperature contract type).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExcursionSummary {
-    pub unit_id: u64,
-    pub violation_count: u32,
-    pub peak_celsius_x100: i32,
-    pub detected_at: u64,
-}
-
+/// Coordinator-local storage keys only.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {

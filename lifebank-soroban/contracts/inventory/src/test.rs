@@ -1807,3 +1807,133 @@ fn test_extend_reservation_unknown_reservation() {
         Err(Ok(crate::error::ContractError::ReservationNotFound))
     );
 }
+
+// ── Storage TTL / ledger fast-forward tests (#52) ─────────────────────────────
+//
+// Storage class & TTL policy for the inventory contract:
+//
+// | Key                       | Class      | Policy horizon                     |
+// |---------------------------|------------|------------------------------------|
+// | DataKey::BloodUnit(id)    | Persistent | max(expiry, now) + BLOOD_UNIT_TTL  |
+// | DataKey::StatusHistory    | Persistent | BLOOD_UNIT_TTL                     |
+// | DataKey::Reservation(id)  | Persistent | RESERVATION_TTL                    |
+// | DataKey::NextId / Admin   | Instance   | INSTANCE_TTL (bumped per entry)    |
+//
+// Entries are bumped on every access; a read/write whose entry has already
+// lapsed past the policy horizon yields `StorageHorizonExceeded` (#170)
+// instead of a host panic.
+
+/// Advance the ledger sequence by `ledgers` and the timestamp by `secs`.
+fn fast_forward(env: &Env, ledgers: u32, secs: u64) {
+    let seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(seq + ledgers);
+    let ts = env.ledger().timestamp();
+    env.ledger().set_timestamp(ts + secs);
+}
+
+/// Default TTL in ledgers, expressed in days for readability.
+fn default_ttl_ledgers() -> u32 {
+    crate::ttl::LEDGERS_PER_DAY * crate::ttl::DEFAULT_TTL_DAYS
+}
+
+/// Policy horizon for blood units, in ledgers.
+fn blood_unit_horizon_ledgers() -> u32 {
+    crate::ttl::LEDGERS_PER_DAY * crate::ttl::BLOOD_UNIT_TTL_DAYS
+}
+
+/// Advance past the default TTL but stay well within the policy horizon and
+/// assert every inventory entrypoint still succeeds.
+#[test]
+fn test_ttl_entries_live_past_default_ttl() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+    let reservation_id = client.reserve_blood(&admin, &vec![&env, unit_id], &42u64, &3600u64);
+
+    // Advance past the default TTL but within the policy horizon.
+    let jump = default_ttl_ledgers() + 1;
+    assert!(jump < blood_unit_horizon_ledgers());
+    fast_forward(&env, jump, 0);
+
+    // Reads still succeed.
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.id, unit_id);
+    assert_eq!(client.get_status_change_count(&unit_id), 0);
+
+    // Reservation reads still succeed.
+    let reservation = client.get_reservation(&reservation_id);
+    assert_eq!(reservation.request_id, 42u64);
+
+    // Writes still succeed.
+    client.release_reservation(&reservation_id);
+    assert_eq!(client.get_blood_unit(&unit_id).status, BloodStatus::Available);
+    let updated = client.update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    assert_eq!(updated.status, BloodStatus::Reserved);
+}
+
+/// At horizon−1 the entry is still live and all entrypoints succeed.
+#[test]
+fn test_ttl_boundary_horizon_minus_one_succeeds() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    fast_forward(&env, blood_unit_horizon_ledgers() - 1, 0);
+
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.id, unit_id);
+    let updated = client.update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    assert_eq!(updated.status, BloodStatus::Reserved);
+}
+
+/// At horizon+1 the entry has lapsed past the policy horizon: the contract
+/// must return the documented `StorageHorizonExceeded` error, not panic.
+#[test]
+fn test_ttl_boundary_horizon_plus_one_errors() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    fast_forward(&env, blood_unit_horizon_ledgers() + 1, 0);
+
+    let result = client.try_get_blood_unit(&unit_id);
+    assert_eq!(
+        result,
+        Err(Ok(crate::error::ContractError::StorageHorizonExceeded))
+    );
+
+    let result = client.try_update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    assert_eq!(
+        result,
+        Err(Ok(crate::error::ContractError::StorageHorizonExceeded))
+    );
+}
+
+/// A lock-then-dispute style flow spanning a simulated 30-day gap: the unit
+/// is reserved, 30 days pass, and the reservation can still be released and
+/// the unit re-read without any host panic.
+#[test]
+fn test_ttl_thirty_day_gap_flow_succeeds() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+    let reservation_id = client.reserve_blood(&admin, &vec![&env, unit_id], &42u64, &3600u64);
+
+    // Simulate a 30-day gap.
+    let thirty_days_ledgers = crate::ttl::LEDGERS_PER_DAY * 30;
+    fast_forward(&env, thirty_days_ledgers, 30 * 86400);
+
+    // Reservation and unit remain readable.
+    let reservation = client.get_reservation(&reservation_id);
+    assert_eq!(reservation.request_id, 42u64);
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.id, unit_id);
+
+    // Release still works after the gap.
+    client.release_reservation(&reservation_id);
+    assert_eq!(client.get_blood_unit(&unit_id).status, BloodStatus::Available);
+}

@@ -7,6 +7,10 @@ import { Repository } from 'typeorm';
 import { PaginatedResponse, PaginationUtil } from '../common/pagination';
 
 import {
+  ContractDomain,
+  ContractEventType,
+} from '../../__contracts__/generated';
+import {
   DiscardPoisonEventDto,
   IngestEventDto,
   QueryContractEventsDto,
@@ -14,10 +18,7 @@ import {
   ReplayFromLedgerDto,
   ReplayPoisonEventDto,
 } from './dto/contract-event.dto';
-import {
-  ContractDomain,
-  ContractEventEntity,
-} from './entities/contract-event.entity';
+import { ContractEventEntity } from './entities/contract-event.entity';
 import { IndexerCursorEntity } from './entities/indexer-cursor.entity';
 import {
   PoisonEventEntity,
@@ -123,7 +124,9 @@ export class ContractEventIndexerService {
     if (query.domain)
       qb.andWhere('e.domain = :domain', { domain: query.domain });
     if (query.eventType)
-      qb.andWhere('e.event_type = :eventType', { eventType: query.eventType });
+      qb.andWhere('e.event_type = :eventType', {
+        eventType: query.eventType as ContractEventType,
+      });
     if (query.entityRef)
       qb.andWhere('e.entity_ref = :entityRef', { entityRef: query.entityRef });
 
