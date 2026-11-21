@@ -15,6 +15,9 @@ lifebank-interfaces = { path = "../interfaces" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
+[dependencies.lifebank-interfaces]
+workspace = true
+
 [features]
 # Enables the full upgrade rehearsal test, which swaps in the real compiled
 # WASM. Build the workspace WASMs first: scripts/test-upgrade-rehearsal.sh

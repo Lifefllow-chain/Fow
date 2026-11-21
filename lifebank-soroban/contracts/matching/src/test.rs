@@ -11,7 +11,8 @@ mod pure_matching {
     use crate::matching::{
         compatible_donor_types, is_compatible, score_unit, select_units, sort_by_expiration,
     };
-    use crate::types::{BloodStatus, BloodType, BloodUnit, MatchKind, Urgency};
+    use crate::types::MatchKind;
+    use lifebank_interfaces::{BloodStatus, BloodType, BloodUnit, Urgency};
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

@@ -1,11 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/interfaces",
   "contracts/*",
 ]
 
 [workspace.dependencies]
 soroban-sdk = "23"
+lifebank-interfaces = { path = "crates/interfaces" }
 
 [profile.release]
 opt-level = "z"

@@ -16,3 +16,6 @@ lifebank-interfaces = { path = "../interfaces" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 inventory-contract = { path = "../inventory" }
 request-contract   = { path = "../requests" }
+
+[dependencies.lifebank-interfaces]
+workspace = true

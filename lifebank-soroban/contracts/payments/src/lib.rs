@@ -5,6 +5,9 @@ use soroban_sdk::{
     Vec,
 };
 
+// Cross-contract types — single source of truth from the interfaces crate.
+pub use lifebank_interfaces::{DisputeReason, Payment, PaymentStatus};
+
 // Credential type mirrored from identity contract.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,68 +30,6 @@ mod identity_client {
 }
 
 use identity_client::IdentityContractClient;
-
-// ── Types ──────────────────────────────────────────────────────────────────────
-
-/// Payment lifecycle state machine — the single documented source of truth
-/// for every status transition in this contract.
-///
-/// ```text
-///  Pending ──(create_escrow deposits token)───────────────► Locked
-///  Locked  ──(release_escrow, admin/coordinator)──────────► Released  (terminal, token → payee)
-///  Locked  ──(refund_escrow, admin/coordinator)───────────► Refunded  (terminal, token → payer)
-///  Locked  ──(record_dispute, payer/payee/admin/coord.)───► Disputed
-///  Disputed──(resolve_dispute, admin/coordinator)─────────► Locked    (actionable again)
-///  Disputed──(process_expired_disputes, timeout elapsed)──► Refunded  (terminal, token → payer)
-/// ```
-///
-/// Invariant: every transition into `Released` or `Refunded` happens in the
-/// same function that performs the matching `token::Client::transfer` — see
-/// `release_escrow`, `refund_escrow`, and `process_expired_disputes`. There
-/// is deliberately no generic status setter: a prior `update_status`
-/// function let any caller flip a payment to any status (including
-/// `Released`/`Refunded`) with no token movement and no auth check, which
-/// could permanently strand escrowed funds. It has been removed.
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaymentStatus {
-    Pending,
-    Locked,
-    Released,
-    Refunded,
-    Disputed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisputeReason {
-    FailedDelivery,
-    TemperatureExcursion,
-    PaymentContested,
-    WrongItem,
-    DamagedGoods,
-    LateDelivery,
-    Other,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Payment {
-    pub id: u64,
-    pub request_id: u64,
-    pub payer: Address,
-    pub payee: Address,
-    pub amount: i128,
-    pub status: PaymentStatus,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub dispute_reason_code: Option<u32>,
-    pub dispute_case_id: Option<String>,
-    pub dispute_resolved: bool,
-    /// Token contract address — set only for escrow-backed payments.
-    pub token: Option<Address>,
-}
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
     match reason {
