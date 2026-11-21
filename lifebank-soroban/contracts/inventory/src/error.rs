@@ -45,4 +45,8 @@ pub enum ContractError {
 
     // Upgrade lifecycle (170)
     MigrationAlreadyApplied = 170,
+
+    /// A persistent entry required by this call has passed its documented TTL
+    /// policy horizon and must be restored before use.
+    StorageHorizonExceeded = 180,
 }

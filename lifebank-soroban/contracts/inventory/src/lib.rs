@@ -8,6 +8,7 @@ mod validation;
 
 use crate::error::ContractError;
 use crate::types::{is_valid_transition, BloodStatus, BloodType, BloodUnit, DataKey, Reservation};
+use lifebank_interfaces::ttl;
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 #[contract]
@@ -95,6 +96,29 @@ impl InventoryContract {
         Ok(())
     }
 
+    /// Extend the contract instance storage TTL. Called at the top of every
+    /// entrypoint so instance entries (admin, counters, pause flag, schema
+    /// version) never archive. See `lifebank_interfaces::ttl` for the policy.
+    fn extend_instance(env: &Env) {
+        ttl::bump_instance(env);
+    }
+
+    /// Load a blood unit, distinguishing a never-registered key (`NotFound`)
+    /// from a key that exists but has passed its documented TTL policy horizon
+    /// (`StorageHorizonExceeded`) — the latter must be restored before use.
+    fn load_blood_unit_checked(env: &Env, unit_id: u64) -> Result<BloodUnit, ContractError> {
+        match storage::get_blood_unit(env, unit_id) {
+            Some(unit) => Ok(unit),
+            None => {
+                if storage::blood_unit_exists(env, unit_id) {
+                    Err(ContractError::StorageHorizonExceeded)
+                } else {
+                    Err(ContractError::NotFound)
+                }
+            }
+        }
+    }
+
     /// Register a new blood donation into the inventory
     ///
     /// Both `donation_timestamp` (collected_at) and `expiration_timestamp` (expiry_at)
@@ -127,6 +151,7 @@ impl InventoryContract {
         quantity_ml: u32,
         donor_id: Option<Address>,
     ) -> Result<u64, ContractError> {
+        Self::extend_instance(&env);
         // 1. Verify bank authentication
         bank_id.require_auth();
 
@@ -237,7 +262,8 @@ impl InventoryContract {
     /// # Errors
     /// - `NotFound`: Blood unit with given ID doesn't exist
     pub fn get_blood_unit(env: Env, blood_unit_id: u64) -> Result<BloodUnit, ContractError> {
-        storage::get_blood_unit(&env, blood_unit_id).ok_or(ContractError::NotFound)
+        Self::extend_instance(&env);
+        Self::load_blood_unit_checked(&env, blood_unit_id)
     }
 
     pub fn update_status(
@@ -247,6 +273,7 @@ impl InventoryContract {
         authorized_by: Address,
         reason: Option<String>,
     ) -> Result<BloodUnit, ContractError> {
+        Self::extend_instance(&env);
         authorized_by.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -256,8 +283,7 @@ impl InventoryContract {
             return Err(ContractError::Unauthorized);
         }
 
-        let mut blood_unit =
-            storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+        let mut blood_unit = Self::load_blood_unit_checked(&env, unit_id)?;
 
         let current_time = env.ledger().timestamp();
         let old_status = blood_unit.status;
@@ -376,6 +402,7 @@ impl InventoryContract {
         authorized_by: Address,
         reason: Option<String>,
     ) -> Result<u64, ContractError> {
+        Self::extend_instance(&env);
         authorized_by.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -390,8 +417,7 @@ impl InventoryContract {
 
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
-            let mut blood_unit =
-                storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+            let mut blood_unit = Self::load_blood_unit_checked(&env, unit_id)?;
 
             let old_status = blood_unit.status;
             if blood_unit.is_expired(current_time) {
@@ -444,6 +470,7 @@ impl InventoryContract {
     }
 
     pub fn get_status_history(env: Env, unit_id: u64) -> Vec<crate::types::StatusChangeHistory> {
+        Self::extend_instance(&env);
         storage::get_status_history(&env, unit_id)
     }
 
@@ -453,15 +480,18 @@ impl InventoryContract {
         unit_id: u64,
         page: u32,
     ) -> Vec<crate::types::StatusChangeHistory> {
+        Self::extend_instance(&env);
         storage::get_status_history_page(&env, unit_id, page)
     }
 
     /// Return the last page number for a unit's history (0-based).
     pub fn get_history_page_count(env: Env, unit_id: u64) -> u32 {
+        Self::extend_instance(&env);
         storage::get_history_page_count(&env, unit_id)
     }
 
     pub fn get_status_change_count(env: Env, unit_id: u64) -> u64 {
+        Self::extend_instance(&env);
         storage::get_blood_unit_status_change_count(&env, unit_id)
     }
 
@@ -472,6 +502,7 @@ impl InventoryContract {
         bank_id: Address,
         entries: Vec<(BloodType, u32, Option<Address>)>,
     ) -> Result<Vec<u64>, ContractError> {
+        Self::extend_instance(&env);
         bank_id.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -523,6 +554,7 @@ impl InventoryContract {
         request_id: u64,
         duration_seconds: u64,
     ) -> Result<u64, ContractError> {
+        Self::extend_instance(&env);
         requester.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -583,6 +615,7 @@ impl InventoryContract {
     /// Records a status history entry and emits a status-change event for every
     /// unit that transitions Reserved → Available, preserving the full audit trail.
     pub fn release_reservation(env: Env, reservation_id: u64) -> Result<(), ContractError> {
+        Self::extend_instance(&env);
         Self::require_not_paused(&env)?;
         let reservation = storage::get_reservation(&env, reservation_id)
             .ok_or(ContractError::ReservationNotFound)?;
@@ -634,6 +667,7 @@ impl InventoryContract {
         additional_seconds: u64,
         authorized_by: Address,
     ) -> Result<Reservation, ContractError> {
+        Self::extend_instance(&env);
         authorized_by.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -657,6 +691,7 @@ impl InventoryContract {
 
     /// Get a reservation by ID.
     pub fn get_reservation(env: Env, reservation_id: u64) -> Result<Reservation, ContractError> {
+        Self::extend_instance(&env);
         storage::get_reservation(&env, reservation_id).ok_or(ContractError::ReservationNotFound)
     }
 
@@ -669,6 +704,7 @@ impl InventoryContract {
         requester: Address,
         batch: Vec<(Vec<u64>, u64, u64)>,
     ) -> Result<Vec<u64>, ContractError> {
+        Self::extend_instance(&env);
         requester.require_auth();
 
         Self::require_not_paused(&env)?;
@@ -699,12 +735,14 @@ impl InventoryContract {
     // ── Upgradeability & versioned storage schema (#31) ──────────────────────
 
     /// Code version of the currently deployed binary.
-    pub fn version(_env: Env) -> u32 {
+    pub fn version(env: Env) -> u32 {
+        Self::extend_instance(&env);
         CONTRACT_VERSION
     }
 
     /// Storage schema version currently recorded on-chain (1 when unset).
     pub fn schema_version(env: Env) -> u32 {
+        Self::extend_instance(&env);
         env.storage()
             .instance()
             .get(&SCHEMA_VERSION_KEY)
@@ -715,6 +753,7 @@ impl InventoryContract {
     /// The contract ID and all storage are preserved; call `migrate` after
     /// the upgrade when the new binary bumps `TARGET_SCHEMA_VERSION`.
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), ContractError> {
+        Self::extend_instance(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -729,6 +768,7 @@ impl InventoryContract {
     /// Refuses to run once storage already sits at `TARGET_SCHEMA_VERSION`,
     /// so a migration can never be applied twice.
     pub fn migrate(env: Env) -> Result<u32, ContractError> {
+        Self::extend_instance(&env);
         let admin: Address = env
             .storage()
             .instance()
