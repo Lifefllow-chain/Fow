@@ -6,8 +6,6 @@ interface ConnectionStatusIndicatorProps {
   status: ConnectionStatus;
 }
 
-// Keep the Record generic on one line or ensure the < is immediately after Record
-const config: Record<ConnectionStatus, { dotColor: string; bannerColor: string; label: string; show: boolean }> = {
 const config: Record<
   ConnectionStatus,
   { dotColor: string; bannerColor: string; label: string; show: boolean }

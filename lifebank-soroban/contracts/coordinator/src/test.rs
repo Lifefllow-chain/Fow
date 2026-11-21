@@ -13,7 +13,7 @@ use soroban_sdk::{
 };
 
 use super::{
-    BloodRequest, BloodStatus, BloodUnit, CoordinatorContract, CoordinatorContractClient,
+    BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract, CoordinatorContractClient,
     CoordinatorError, DisputeReason, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
 };
 
@@ -54,6 +54,24 @@ impl MockRequestContract {
         env.storage().persistent().set(&ReqKey::Request(id), &req);
     }
 
+    pub fn seed_request_with_type(env: Env, id: u64, status: RequestStatus, blood_type: BloodType) {
+        let req = BloodRequest {
+            id,
+            hospital_id: Address::generate(&env),
+            blood_type,
+            component: BloodComponent::WholeBlood,
+            quantity_ml: 450,
+            urgency: Urgency::Routine,
+            created_timestamp: 0,
+            required_by_timestamp: u64::MAX,
+            status,
+            assigned_units: Vec::new(&env),
+            fulfilled_quantity_ml: 0,
+            reservation_id: None,
+        };
+        env.storage().persistent().set(&ReqKey::Request(id), &req);
+    }
+
     pub fn get_request(env: Env, request_id: u64) -> BloodRequest {
         env.storage()
             .persistent()
@@ -70,6 +88,9 @@ enum InvKey {
     Admin,
     Counter,
     FailUpdateUnit(u64),
+    Reservation(u64),
+    ReservationCounter,
+    FailReleaseReservation(u64),
 }
 
 #[contract]
@@ -90,7 +111,7 @@ impl MockInventoryContract {
         env.storage().instance().get(&InvKey::Admin).unwrap()
     }
 
-    pub fn register_unit(env: Env) -> u64 {
+    pub fn register_unit(env: Env, blood_type: BloodType) -> u64 {
         let id: u64 = env
             .storage()
             .instance()
@@ -109,6 +130,7 @@ impl MockInventoryContract {
                 donation_timestamp: 0,
                 expiration_timestamp: u64::MAX,
                 status: BloodStatus::Available,
+                blood_type,
                 metadata: Map::new(&env),
             },
         );
@@ -170,6 +192,115 @@ impl MockInventoryContract {
             Some(delivery_location),
         )
     }
+
+    /// Force `release_reservation` to panic for a specific reservation, so
+    /// tests can exercise the "cross-contract call fails, no partial state"
+    /// path the way `fail_update_for_unit` does for `update_status`.
+    pub fn fail_release_for_reservation(env: Env, reservation_id: u64) {
+        env.storage()
+            .persistent()
+            .set(&InvKey::FailReleaseReservation(reservation_id), &true);
+    }
+
+    pub fn reserve_blood(
+        env: Env,
+        requester: Address,
+        unit_ids: Vec<u64>,
+        request_id: u64,
+        duration_seconds: u64,
+    ) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&InvKey::ReservationCounter)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&InvKey::ReservationCounter, &id);
+
+        let now = env.ledger().timestamp();
+        let reservation = super::Reservation {
+            unit_ids: unit_ids.clone(),
+            requester,
+            created_timestamp: now,
+            expiration_timestamp: now + duration_seconds,
+            request_id,
+        };
+        env.storage()
+            .persistent()
+            .set(&InvKey::Reservation(id), &reservation);
+
+        for i in 0..unit_ids.len() {
+            let uid = unit_ids.get(i).unwrap();
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&InvKey::Unit(uid))
+                .unwrap();
+            unit.status = BloodStatus::Reserved;
+            env.storage().persistent().set(&InvKey::Unit(uid), &unit);
+        }
+
+        id
+    }
+
+    pub fn release_reservation(env: Env, reservation_id: u64) {
+        if env
+            .storage()
+            .persistent()
+            .get(&InvKey::FailReleaseReservation(reservation_id))
+            .unwrap_or(false)
+        {
+            panic!("forced release_reservation failure");
+        }
+
+        let reservation: super::Reservation = env
+            .storage()
+            .persistent()
+            .get(&InvKey::Reservation(reservation_id))
+            .unwrap();
+
+        for i in 0..reservation.unit_ids.len() {
+            let uid = reservation.unit_ids.get(i).unwrap();
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&InvKey::Unit(uid))
+                .unwrap();
+            if unit.status == BloodStatus::Reserved {
+                unit.status = BloodStatus::Available;
+                env.storage().persistent().set(&InvKey::Unit(uid), &unit);
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&InvKey::Reservation(reservation_id));
+    }
+
+    pub fn get_reservation(env: Env, reservation_id: u64) -> super::Reservation {
+        env.storage()
+            .persistent()
+            .get(&InvKey::Reservation(reservation_id))
+            .unwrap()
+    }
+
+    pub fn extend_reservation(
+        env: Env,
+        reservation_id: u64,
+        additional_seconds: u64,
+        _authorized_by: Address,
+    ) -> super::Reservation {
+        let mut reservation: super::Reservation = env
+            .storage()
+            .persistent()
+            .get(&InvKey::Reservation(reservation_id))
+            .unwrap();
+        reservation.expiration_timestamp += additional_seconds;
+        env.storage()
+            .persistent()
+            .set(&InvKey::Reservation(reservation_id), &reservation);
+        reservation
+    }
 }
 
 // ── Mock: Payment contract ────────────────────────────────────────────────────
@@ -177,8 +308,18 @@ impl MockInventoryContract {
 #[contracttype]
 enum PayKey {
     Payment(u64),
+    Escrow(u64),
     Counter,
     FailUpdates,
+    Coordinator,
+}
+
+#[contracttype]
+struct MockEscrowInfo {
+    payer: Address,
+    payee: Address,
+    amount: i128,
+    token: Address,
 }
 
 #[contract]
@@ -220,6 +361,34 @@ impl MockPaymentContract {
         id
     }
 
+    /// Seed a payment that also holds real escrowed tokens, so tests can
+    /// assert `release_escrow`/`refund_escrow` move an actual token balance
+    /// instead of only flipping a status label. Payments created via plain
+    /// `create_payment` have no escrow entry; `release_escrow`/`refund_escrow`
+    /// on those skip the transfer (nothing to move) and only update status,
+    /// which is enough for the many workflow-shape tests that don't care
+    /// about money.
+    pub fn seed_escrow(
+        env: Env,
+        request_id: u64,
+        payer: Address,
+        payee: Address,
+        amount: i128,
+        token: Address,
+    ) -> u64 {
+        let id = Self::create_payment(env.clone(), request_id, PaymentStatus::Locked);
+        env.storage().persistent().set(
+            &PayKey::Escrow(id),
+            &MockEscrowInfo {
+                payer,
+                payee,
+                amount,
+                token,
+            },
+        );
+        id
+    }
+
     pub fn get_payment(env: Env, payment_id: u64) -> Payment {
         env.storage()
             .persistent()
@@ -231,7 +400,18 @@ impl MockPaymentContract {
         env.storage().persistent().set(&PayKey::FailUpdates, &true);
     }
 
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn set_coordinator(env: Env, coordinator: Address) {
+        env.storage()
+            .instance()
+            .set(&PayKey::Coordinator, &coordinator);
+    }
+
+    pub fn get_coordinator(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PayKey::Coordinator)
+    }
+
+    fn check_authorized(env: &Env, caller: &Address) {
+        caller.require_auth();
         if env
             .storage()
             .persistent()
@@ -240,19 +420,58 @@ impl MockPaymentContract {
         {
             panic!("forced payment update failure");
         }
+    }
 
+    pub fn release_escrow(env: Env, caller: Address, payment_id: u64) {
+        Self::check_authorized(&env, &caller);
+        if let Some(esc) = env
+            .storage()
+            .persistent()
+            .get::<_, MockEscrowInfo>(&PayKey::Escrow(payment_id))
+        {
+            let token_client = soroban_sdk::token::Client::new(&env, &esc.token);
+            token_client.transfer(&env.current_contract_address(), &esc.payee, &esc.amount);
+        }
         let mut p: Payment = env
             .storage()
             .persistent()
             .get(&PayKey::Payment(payment_id))
             .unwrap();
-        p.status = status;
+        p.status = PaymentStatus::Released;
         env.storage()
             .persistent()
             .set(&PayKey::Payment(payment_id), &p);
     }
 
-    pub fn record_dispute(env: Env, payment_id: u64, _reason: DisputeReason, _case_id: String) {
+    pub fn refund_escrow(env: Env, caller: Address, payment_id: u64) {
+        Self::check_authorized(&env, &caller);
+        if let Some(esc) = env
+            .storage()
+            .persistent()
+            .get::<_, MockEscrowInfo>(&PayKey::Escrow(payment_id))
+        {
+            let token_client = soroban_sdk::token::Client::new(&env, &esc.token);
+            token_client.transfer(&env.current_contract_address(), &esc.payer, &esc.amount);
+        }
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .unwrap();
+        p.status = PaymentStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
+    pub fn record_dispute(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+        _reason: DisputeReason,
+        _case_id: String,
+    ) {
+        caller.require_auth();
         let mut p: Payment = env
             .storage()
             .persistent()
@@ -276,23 +495,38 @@ struct Harness<'a> {
     pay_id: Address,
 }
 
+/// Registers the four domain mocks plus the coordinator, honoring the
+/// coordinator's admin-wiring invariant: `inventory.get_admin() ==
+/// coordinator_address`.
+///
+/// The coordinator's constructor asserts this equality, but inventory's
+/// admin can only be set once, at inventory's own construction — so the
+/// coordinator's address must be known and given to inventory *before* the
+/// coordinator itself is deployed. `env.register_at` lets a test pre-assign
+/// any address to a not-yet-deployed contract, which resolves the ordering:
+/// generate the coordinator's future address, hand it to inventory as admin,
+/// then deploy the coordinator at that exact address.
 fn setup<'a>() -> Harness<'a> {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
+    let coord_id = Address::generate(&env);
 
     let req_id = env.register(MockRequestContract, ());
     let inv_id = env.register(MockInventoryContract, ());
     let pay_id = env.register(MockPaymentContract, ());
-    let coord_id = env.register(CoordinatorContract, ());
 
-    // Initialize inventory mock with admin
-    let inv = MockInventoryContractClient::new(&env, &inv_id);
-    inv.initialize(&admin);
+    MockInventoryContractClient::new(&env, &inv_id).initialize(&coord_id);
+    MockPaymentContractClient::new(&env, &pay_id).set_coordinator(&coord_id);
+
+    env.register_at(
+        &coord_id,
+        CoordinatorContract,
+        (&admin, &req_id, &inv_id, &pay_id),
+    );
 
     let coord = CoordinatorContractClient::new(&env, &coord_id);
-    coord.initialize(&admin, &req_id, &inv_id, &pay_id);
 
     Harness {
         env,
@@ -309,12 +543,39 @@ fn seed_pending_request(h: &Harness, id: u64) {
 }
 
 fn register_unit(h: &Harness) -> u64 {
-    MockInventoryContractClient::new(&h.env, &h.inv_id).register_unit()
+    MockInventoryContractClient::new(&h.env, &h.inv_id).register_unit(&BloodType::APositive)
 }
 
 fn create_locked_payment(h: &Harness, request_id: u64) -> u64 {
     MockPaymentContractClient::new(&h.env, &h.pay_id)
         .create_payment(&request_id, &PaymentStatus::Locked)
+}
+
+fn create_locked_escrow_payment(
+    h: &Harness,
+    request_id: u64,
+    payer: &Address,
+    payee: &Address,
+    amount: i128,
+    token: &Address,
+) -> u64 {
+    MockPaymentContractClient::new(&h.env, &h.pay_id)
+        .seed_escrow(&request_id, payer, payee, &amount, token)
+}
+
+/// Deploy a minimal Soroban token contract and mint `amount` to `recipient`.
+fn deploy_token_with_balance(env: &Env, admin: &Address, recipient: &Address, amount: i128) -> Address {
+    let token = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_id = token.address();
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
+    token_admin.mint(recipient, &amount);
+    token_id
+}
+
+fn reservation_deadline(h: &Harness, reservation_id: u64) -> u64 {
+    MockInventoryContractClient::new(&h.env, &h.inv_id)
+        .get_reservation(&reservation_id)
+        .expiration_timestamp
 }
 
 // ── Happy path ────────────────────────────────────────────────────────────────
@@ -352,6 +613,86 @@ fn test_full_happy_path() {
 
     let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id);
     assert_eq!(payment.status, PaymentStatus::Released);
+}
+
+// ── Real token movement (settle/expire/rollback must move actual funds) ───────
+
+#[test]
+fn test_settle_payment_releases_real_tokens_to_payee() {
+    let h = setup();
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+
+    let payer = Address::generate(&h.env);
+    let payee = Address::generate(&h.env);
+    let token = deploy_token_with_balance(&h.env, &h.admin, &h.pay_id, 1_000);
+    let payment_id = create_locked_escrow_payment(&h, 1, &payer, &payee, 1_000, &token);
+
+    h.coord
+        .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
+    h.coord.confirm_delivery(&1u64, &h.admin);
+
+    let token_client = soroban_sdk::token::Client::new(&h.env, &token);
+    assert_eq!(token_client.balance(&payee), 0);
+
+    h.coord.settle_payment(&1u64, &h.admin);
+
+    assert_eq!(token_client.balance(&payee), 1_000);
+    let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Released);
+}
+
+#[test]
+fn test_expire_workflow_refunds_real_tokens_to_payer() {
+    let h = setup();
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+
+    let payer = Address::generate(&h.env);
+    let payee = Address::generate(&h.env);
+    let token = deploy_token_with_balance(&h.env, &h.admin, &h.pay_id, 1_000);
+    let payment_id = create_locked_escrow_payment(&h, 1, &payer, &payee, 1_000, &token);
+
+    h.coord
+        .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
+    let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
+    h.env.ledger().with_mut(|l| l.timestamp = deadline + 1);
+
+    let token_client = soroban_sdk::token::Client::new(&h.env, &token);
+    assert_eq!(token_client.balance(&payer), 0);
+
+    h.coord.expire_workflow(&1u64);
+
+    assert_eq!(token_client.balance(&payer), 1_000);
+    assert_eq!(token_client.balance(&h.pay_id), 0);
+    let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Refunded);
+}
+
+#[test]
+fn test_rollback_refunds_real_tokens_to_payer() {
+    let h = setup();
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+
+    let payer = Address::generate(&h.env);
+    let payee = Address::generate(&h.env);
+    let token = deploy_token_with_balance(&h.env, &h.admin, &h.pay_id, 1_000);
+    let payment_id = create_locked_escrow_payment(&h, 1, &payer, &payee, 1_000, &token);
+
+    h.coord
+        .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
+
+    let token_client = soroban_sdk::token::Client::new(&h.env, &token);
+    assert_eq!(token_client.balance(&payer), 0);
+
+    h.coord.rollback(&1u64);
+
+    assert_eq!(token_client.balance(&payer), 1_000);
+    assert_eq!(token_client.balance(&h.pay_id), 0);
+    let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Refunded);
 }
 
 // ── Sequence enforcement ──────────────────────────────────────────────────────
@@ -412,7 +753,7 @@ fn test_confirm_delivery_is_idempotent_after_delivery() {
     let after = h.coord.get_workflow(&1u64);
     assert_eq!(after.status, before.status);
     assert_eq!(after.delivery_confirmed, before.delivery_confirmed);
-    assert_eq!(after.allocation_deadline, before.allocation_deadline);
+    assert_eq!(after.reservation_id, before.reservation_id);
 
     let unit = MockInventoryContractClient::new(&h.env, &h.inv_id).get_blood_unit(&unit_id);
     assert_eq!(unit.status, BloodStatus::Delivered);
@@ -442,6 +783,41 @@ fn test_settle_payment_is_idempotent_after_settlement() {
     assert_eq!(payment.status, PaymentStatus::Released);
 }
 
+/// The reservation created by allocate_units is the sole record of the
+/// allocation deadline: its expiration_timestamp must equal ledger-now plus
+/// ALLOCATION_EXPIRY_SECONDS, and expire_workflow must read that same value
+/// rather than a separately-tracked WorkflowRecord field.
+#[test]
+fn test_reservation_ttl_matches_allocation_expiry_and_gates_expiry() {
+    let h = setup();
+    h.env.ledger().with_mut(|l| l.timestamp = 5_000);
+
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+    let payment_id = create_locked_payment(&h, 1);
+    h.coord
+        .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
+
+    let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
+    assert_eq!(deadline, 5_000 + crate::ALLOCATION_EXPIRY_SECONDS);
+
+    // One second before the reservation's own deadline: still not expirable.
+    h.env.ledger().with_mut(|l| l.timestamp = deadline - 1);
+    assert_eq!(
+        h.coord.try_expire_workflow(&1u64),
+        Err(Ok(CoordinatorError::WorkflowNotExpired))
+    );
+
+    // Past it: expire_workflow succeeds and releases the reservation.
+    h.env.ledger().with_mut(|l| l.timestamp = deadline + 1);
+    h.coord.expire_workflow(&1u64);
+    assert_eq!(h.coord.get_workflow(&1u64).status, WorkflowStatus::Expired);
+
+    let unit = MockInventoryContractClient::new(&h.env, &h.inv_id).get_blood_unit(&unit_id);
+    assert_eq!(unit.status, BloodStatus::Available);
+}
+
 #[test]
 fn test_expire_workflow_rejects_before_deadline() {
     let h = setup();
@@ -469,8 +845,9 @@ fn test_expire_workflow_releases_units_refunds_payment_and_marks_expired() {
     h.coord
         .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
     let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
     h.env.ledger().with_mut(|li| {
-        li.timestamp = wf.allocation_deadline + 1;
+        li.timestamp = deadline + 1;
     });
 
     h.coord.expire_workflow(&1u64);
@@ -496,8 +873,9 @@ fn test_expire_workflow_is_idempotent_after_expiry() {
     h.coord
         .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
     let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
     h.env.ledger().with_mut(|li| {
-        li.timestamp = wf.allocation_deadline + 1;
+        li.timestamp = deadline + 1;
     });
 
     h.coord.expire_workflow(&1u64);
@@ -526,11 +904,13 @@ fn test_expire_workflow_inventory_failure_leaves_no_partial_state() {
         &h.admin,
     );
     let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
     h.env.ledger().with_mut(|li| {
-        li.timestamp = wf.allocation_deadline + 1;
+        li.timestamp = deadline + 1;
     });
 
-    MockInventoryContractClient::new(&h.env, &h.inv_id).fail_update_for_unit(&second_unit_id);
+    MockInventoryContractClient::new(&h.env, &h.inv_id)
+        .fail_release_for_reservation(&wf.reservation_id);
 
     let result = h.coord.try_expire_workflow(&1u64);
     assert!(result.is_err());
@@ -562,8 +942,9 @@ fn test_expire_workflow_payment_failure_leaves_no_partial_state() {
     h.coord
         .allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
     let wf = h.coord.get_workflow(&1u64);
+    let deadline = reservation_deadline(&h, wf.reservation_id);
     h.env.ledger().with_mut(|li| {
-        li.timestamp = wf.allocation_deadline + 1;
+        li.timestamp = deadline + 1;
     });
 
     MockPaymentContractClient::new(&h.env, &h.pay_id).fail_updates();
@@ -741,6 +1122,154 @@ fn test_coordinator_non_admin_cannot_pause() {
     h.coord.pause(&attacker);
 }
 
+// ── Granular pause flag tests ─────────────────────────────────────────────────
+
+/// Guardian can pause the alloc flag; rollback (exit path) still works.
+#[test]
+fn test_guardian_can_pause_alloc_flag() {
+    let h = setup();
+    let guardian = Address::generate(&h.env);
+    h.coord.set_guardian(&h.admin, &guardian);
+
+    use soroban_sdk::symbol_short;
+    h.coord.pause_flag(&guardian, &symbol_short!("alloc"));
+    assert!(h.coord.is_flag_paused(&symbol_short!("alloc")));
+
+    // New allocations blocked
+    seed_pending_request(&h, 50);
+    let uid = register_unit(&h);
+    let pid = create_locked_payment(&h, 50);
+    let result = h.coord.try_allocate_units(&50u64, &vec![&h.env, uid], &pid, &h.admin);
+    assert!(result.is_err());
+}
+
+/// Only admin can unpause; guardian cannot.
+#[test]
+#[should_panic]
+fn test_guardian_cannot_unpause() {
+    let h = setup();
+    let guardian = Address::generate(&h.env);
+    h.coord.set_guardian(&h.admin, &guardian);
+    use soroban_sdk::symbol_short;
+    h.coord.pause_flag(&guardian, &symbol_short!("alloc"));
+    h.coord.unpause_flag(&guardian, &symbol_short!("alloc"));
+}
+
+/// Pausing alloc does NOT block settle (different flag).
+#[test]
+fn test_alloc_pause_does_not_block_settle() {
+    let h = setup();
+    use soroban_sdk::symbol_short;
+    seed_pending_request(&h, 60);
+    let uid = register_unit(&h);
+    let pid = create_locked_payment(&h, 60);
+    h.coord.allocate_units(&60u64, &vec![&h.env, uid], &pid, &h.admin);
+    h.coord.confirm_delivery(&60u64, &h.admin);
+
+    // Pause alloc — settle must still work
+    h.coord.pause_flag(&h.admin, &symbol_short!("alloc"));
+    h.coord.settle_payment(&60u64, &h.admin);
+    assert_eq!(h.coord.get_workflow(&60u64).status, WorkflowStatus::Settled);
+}
+
+/// Auto-enable: after MAX_PAUSE_SECS the flag is treated as unpaused.
+#[test]
+fn test_auto_enable_after_max_pause_secs() {
+    use crate::MAX_PAUSE_SECS;
+    use soroban_sdk::symbol_short;
+    let h = setup();
+    h.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    h.coord.pause_flag(&h.admin, &symbol_short!("alloc"));
+    assert!(h.coord.is_flag_paused(&symbol_short!("alloc")));
+
+    // Advance past the safety window
+    h.env.ledger().with_mut(|l| l.timestamp = 1_000 + MAX_PAUSE_SECS + 1);
+    assert!(!h.coord.is_flag_paused(&symbol_short!("alloc")));
+
+    // New allocations must succeed after auto-enable
+    seed_pending_request(&h, 70);
+    let uid = register_unit(&h);
+    let pid = create_locked_payment(&h, 70);
+    h.coord.allocate_units(&70u64, &vec![&h.env, uid], &pid, &h.admin);
+    assert_eq!(h.coord.get_workflow(&70u64).status, WorkflowStatus::Allocated);
+}
+
+/// Exit-always property test: under every combination of the 3 pause flags,
+/// rollback (the canonical exit path) remains callable on an Allocated workflow.
+/// This covers all 8 elements of the flag lattice {alloc, dlvr, settl}^2.
+#[test]
+fn test_exit_always_invariant_over_flag_lattice() {
+    use crate::MAX_PAUSE_SECS;
+    use soroban_sdk::symbol_short;
+    let flag_list = [symbol_short!("alloc"), symbol_short!("dlvr"), symbol_short!("settl")];
+
+    for mask in 0u8..8u8 {
+        let h = setup();
+        h.env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+        let req_id = 200u64 + mask as u64;
+        seed_pending_request(&h, req_id);
+        let uid = register_unit(&h);
+        let pid = create_locked_payment(&h, req_id);
+        h.coord.allocate_units(&req_id, &vec![&h.env, uid], &pid, &h.admin);
+
+        // Apply the flag combination for this mask
+        for (i, flag) in flag_list.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                h.coord.pause_flag(&h.admin, flag);
+            }
+        }
+
+        // Rollback (exit path) must always succeed regardless of flag combination
+        h.coord.rollback(&req_id);
+        assert_eq!(
+            h.coord.get_workflow(&req_id).status,
+            WorkflowStatus::RolledBack,
+            "exit path blocked for flag mask {mask}"
+        );
+        let pay = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&pid);
+        assert_eq!(
+            pay.status,
+            PaymentStatus::Refunded,
+            "payment not refunded for flag mask {mask}"
+        );
+    }
+}
+
+/// Deadline extension: pausing dlvr extends the reservation's deadline
+/// (in inventory) by the pause duration.
+#[test]
+fn test_deadline_extended_during_dlvr_pause() {
+    use soroban_sdk::symbol_short;
+    let h = setup();
+    h.env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    seed_pending_request(&h, 80);
+    let uid = register_unit(&h);
+    let pid = create_locked_payment(&h, 80);
+    h.coord.allocate_units(&80u64, &vec![&h.env, uid], &pid, &h.admin);
+    let wf = h.coord.get_workflow(&80u64);
+    let original_deadline = reservation_deadline(&h, wf.reservation_id);
+
+    // Pause dlvr at t=1000, unpause at t=2000 (1000s pause)
+    h.coord.pause_flag(&h.admin, &symbol_short!("dlvr"));
+    h.env.ledger().with_mut(|l| l.timestamp = 2_000);
+    h.coord.unpause_flag(&h.admin, &symbol_short!("dlvr"));
+
+    // confirm_delivery should extend the deadline
+    h.coord.confirm_delivery(&80u64, &h.admin);
+    let wf = h.coord.get_workflow(&80u64);
+    let new_deadline = reservation_deadline(&h, wf.reservation_id);
+    // deadline must be >= original + 1000s pause duration
+    assert!(
+        new_deadline >= original_deadline + 1_000,
+        "deadline not extended: got {}, expected >= {}",
+        new_deadline,
+        original_deadline + 1_000
+    );
+}
+
+
 // ── Temperature excursion → dispute integration tests (issue #477) ────────────
 
 use super::ExcursionSummary;
@@ -899,9 +1428,19 @@ mod upgrade_tests {
         let h = setup();
 
         // Simulate storage written by an older binary (schema 0 < target).
-        let coord_id = h.env.register(CoordinatorContract, ());
+        // Register a fresh coordinator with constructor args, honoring the
+        // same admin-wiring invariant as `setup()`.
+        let admin = Address::generate(&h.env);
+        let coord_id = Address::generate(&h.env);
+        let inv_id = h.env.register(MockInventoryContract, ());
+        MockInventoryContractClient::new(&h.env, &inv_id).initialize(&coord_id);
+        MockPaymentContractClient::new(&h.env, &h.pay_id).set_coordinator(&coord_id);
+        h.env.register_at(
+            &coord_id,
+            CoordinatorContract,
+            (&admin, &h.req_id, &inv_id, &h.pay_id),
+        );
         let coord = CoordinatorContractClient::new(&h.env, &coord_id);
-        coord.initialize(&h.admin, &h.req_id, &h.inv_id, &h.pay_id);
         h.env.as_contract(&coord_id, || {
             h.env
                 .storage()
@@ -936,16 +1475,21 @@ mod upgrade_tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
+        let coord_id = Address::generate(&env);
 
         // The requests contract reports an unsupported code version.
         let req_id = env.register(MockIncompatibleContract, ());
         let inv_id = env.register(MockInventoryContract, ());
         let pay_id = env.register(MockPaymentContract, ());
-        let coord_id = env.register(CoordinatorContract, ());
-        MockInventoryContractClient::new(&env, &inv_id).initialize(&admin);
+        MockInventoryContractClient::new(&env, &inv_id).initialize(&coord_id);
+        MockPaymentContractClient::new(&env, &pay_id).set_coordinator(&coord_id);
 
+        env.register_at(
+            &coord_id,
+            CoordinatorContract,
+            (&admin, &req_id, &inv_id, &pay_id),
+        );
         let coord = CoordinatorContractClient::new(&env, &coord_id);
-        coord.initialize(&admin, &req_id, &inv_id, &pay_id);
 
         let result = coord.try_allocate_units(&1u64, &vec![&env, 1u64], &1u64, &admin);
         assert_eq!(
@@ -972,15 +1516,20 @@ mod upgrade_tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
+        let coord_id = Address::generate(&env);
 
         let req_id = env.register(MockVersionlessContract, ());
         let inv_id = env.register(MockInventoryContract, ());
         let pay_id = env.register(MockPaymentContract, ());
-        let coord_id = env.register(CoordinatorContract, ());
-        MockInventoryContractClient::new(&env, &inv_id).initialize(&admin);
+        MockInventoryContractClient::new(&env, &inv_id).initialize(&coord_id);
+        MockPaymentContractClient::new(&env, &pay_id).set_coordinator(&coord_id);
 
+        env.register_at(
+            &coord_id,
+            CoordinatorContract,
+            (&admin, &req_id, &inv_id, &pay_id),
+        );
         let coord = CoordinatorContractClient::new(&env, &coord_id);
-        coord.initialize(&admin, &req_id, &inv_id, &pay_id);
 
         let result = coord.try_allocate_units(&1u64, &vec![&env, 1u64], &1u64, &admin);
         assert_eq!(
@@ -1037,5 +1586,118 @@ mod upgrade_rehearsal {
 
         let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id);
         assert_eq!(payment.status, PaymentStatus::Released);
+    }
+}
+
+// ── Blood-type compatibility regression tests ─────────────────────────────────
+
+/// Allocating an O+ unit against an A- request must be rejected on-chain.
+/// O+ can only donate to O+, A+, B+, AB+ — not A-.
+#[test]
+fn test_allocate_rejects_incompatible_blood_type() {
+    let h = setup();
+    // Request requires A- blood
+    MockRequestContractClient::new(&h.env, &h.req_id)
+        .seed_request_with_type(&1u64, &RequestStatus::Pending, &BloodType::ANegative);
+    // Register an O+ unit (incompatible with A-)
+    let unit_id = MockInventoryContractClient::new(&h.env, &h.inv_id)
+        .register_unit(&BloodType::OPositive);
+    let payment_id = create_locked_payment(&h, 1);
+
+    let result = h
+        .coord
+        .try_allocate_units(&1u64, &vec![&h.env, unit_id], &payment_id, &h.admin);
+    assert_eq!(result, Err(Ok(CoordinatorError::IncompatibleBloodType)));
+
+    // No workflow must have been created and the unit must remain Available.
+    assert!(h.coord.try_get_workflow(&1u64).is_err());
+    let unit = MockInventoryContractClient::new(&h.env, &h.inv_id).get_blood_unit(&unit_id);
+    assert_eq!(unit.status, BloodStatus::Available);
+}
+
+/// O- is the universal donor — it must be accepted for every recipient type.
+#[test]
+fn test_allocate_accepts_universal_donor_for_all_recipients() {
+    let recipients = [
+        BloodType::APositive,
+        BloodType::ANegative,
+        BloodType::BPositive,
+        BloodType::BNegative,
+        BloodType::ABPositive,
+        BloodType::ABNegative,
+        BloodType::OPositive,
+        BloodType::ONegative,
+    ];
+
+    for (i, recipient) in recipients.iter().enumerate() {
+        let h = setup();
+        let request_id = i as u64 + 1;
+        MockRequestContractClient::new(&h.env, &h.req_id).seed_request_with_type(
+            &request_id,
+            &RequestStatus::Pending,
+            recipient,
+        );
+        let unit_id = MockInventoryContractClient::new(&h.env, &h.inv_id)
+            .register_unit(&BloodType::ONegative);
+        let payment_id = create_locked_payment(&h, request_id);
+
+        let result = h.coord.try_allocate_units(
+            &request_id,
+            &vec![&h.env, unit_id],
+            &payment_id,
+            &h.admin,
+        );
+        assert!(
+            result.is_ok(),
+            "O- must be accepted for recipient {:?}",
+            recipient
+        );
+    }
+}
+
+// ── Matching-contract compatibility parity ─────────────────────────────────────
+//
+// The coordinator inlines its own copy of the ABO/Rh compatibility matrix
+// (see `is_compatible` in lib.rs) rather than cross-calling the matching
+// contract's `match_request` for every allocation. matching-contract is kept
+// as a pre-allocation advisory: a caller can query it to decide which
+// unit_ids to submit to allocate_units, but allocate_units independently
+// re-validates compatibility. This test proves the two copies of the
+// compatibility predicate can never diverge — the property both the
+// advisory recommendation and the authoritative check ultimately rely on.
+#[test]
+fn test_coordinator_and_matching_compatibility_never_diverge() {
+    let types = [
+        BloodType::APositive,
+        BloodType::ANegative,
+        BloodType::BPositive,
+        BloodType::BNegative,
+        BloodType::ABPositive,
+        BloodType::ABNegative,
+        BloodType::OPositive,
+        BloodType::ONegative,
+    ];
+    let matching_types = [
+        matching_contract::BloodType::APositive,
+        matching_contract::BloodType::ANegative,
+        matching_contract::BloodType::BPositive,
+        matching_contract::BloodType::BNegative,
+        matching_contract::BloodType::ABPositive,
+        matching_contract::BloodType::ABNegative,
+        matching_contract::BloodType::OPositive,
+        matching_contract::BloodType::ONegative,
+    ];
+
+    for (i, donor) in types.iter().enumerate() {
+        for (j, recipient) in types.iter().enumerate() {
+            let coord_result = super::is_compatible(*donor, *recipient);
+            let matching_result =
+                matching_contract::is_compatible(matching_types[i], matching_types[j]);
+            assert_eq!(
+                coord_result, matching_result,
+                "compatibility mismatch for donor={:?} recipient={:?}: coordinator={}, matching={}",
+                donor, recipient, coord_result, matching_result
+            );
+        }
     }
 }

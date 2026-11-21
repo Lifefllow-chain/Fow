@@ -25,13 +25,24 @@ pub enum CoordinatorError {
     InvalidPaymentState = 825,
     DeliveryNotConfirmed = 826,
 
+    // Blood-type compatibility
+    IncompatibleBloodType = 828,
+
     // Cross-contract call failures
     InventoryUpdateFailed = 830,
     PaymentUpdateFailed = 831,
     PaymentFlagFailed = 832,
 
+    // Admin wiring
+    InventoryAdminMismatch = 833,
+    /// The payments contract's coordinator role is not wired to this
+    /// coordinator's own address.
+    PaymentCoordinatorMismatch = 834,
+
     // Circuit breaker
     ContractPaused = 840,
+    /// The requested pause flag name is not recognised.
+    UnknownPauseFlag = 841,
 
     // Upgrade lifecycle (#31)
     MigrationAlreadyApplied = 850,

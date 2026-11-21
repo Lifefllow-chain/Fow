@@ -18,6 +18,7 @@ dependencies = [
 name = "analytics-contract"
 version = "0.0.0"
 dependencies = [
+ "lifebank-interfaces",
  "soroban-sdk",
 ]
 
@@ -266,6 +267,7 @@ dependencies = [
  "delivery-contract",
  "inventory-contract",
  "lifebank-interfaces",
+ "matching-contract",
  "payment-contract",
  "request-contract",
  "soroban-sdk",
@@ -442,6 +444,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 name = "delivery-contract"
 version = "0.0.0"
 dependencies = [
+ "lifebank-interfaces",
  "soroban-sdk",
 ]
 
@@ -773,6 +776,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 name = "identity-contract"
 version = "0.0.0"
 dependencies = [
+ "lifebank-interfaces",
  "soroban-sdk",
 ]
 
@@ -1104,6 +1108,7 @@ dependencies = [
 name = "reputation-contract"
 version = "0.0.0"
 dependencies = [
+ "lifebank-interfaces",
  "soroban-sdk",
 ]
 
@@ -1609,6 +1614,7 @@ dependencies = [
 name = "temperature-contract"
 version = "0.0.0"
 dependencies = [
+ "lifebank-interfaces",
  "soroban-sdk",
 ]
 

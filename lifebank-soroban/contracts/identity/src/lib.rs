@@ -4,6 +4,9 @@ use soroban_sdk::{
     String, Symbol, Vec,
 };
 
+pub mod attestation;
+pub use attestation::{AttestationPage, Attestation, CredentialType, GracePolicy, QuorumConfig};
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -27,6 +30,9 @@ pub enum Error {
     AlreadyUnverified = 212,
     ContractPaused = 213,
     MigrationAlreadyApplied = 214,
+    AttestationNotFound = 215,
+    AlreadyRevoked = 216,
+    CredentialInvalid = 217,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +178,16 @@ pub enum DataKey {
     // Fine-grained permission scopes (Issue #374)
     AddressScopes(Address),
     Paused,
+    // Attestation lifecycle
+    AttestationCounter,
+    Attestation(u64),
+    AttestationSubjectIndex(Address, attestation::CredentialType),
+    IssuerAuth(Address, attestation::CredentialType),
+    GracePolicy(attestation::CredentialType),
+    GraceEligibility(attestation::CredentialType),
+    QuorumConfig(attestation::CredentialType),
+    QuorumPending(Address, attestation::CredentialType),
+    IssuerFlagged(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +199,21 @@ pub struct IdentityContract;
 
 #[contractimpl]
 impl IdentityContract {
+    /// Atomic constructor — deploy + init in a single transaction.
+    pub fn __constructor(env: Env, admin: Address) {
+        if Self::is_initialized(env.clone()) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::OrgCounter, &0u32);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        Self::grant_role(env.clone(), admin.clone(), Role::Admin);
+        env.events()
+            .publish((symbol_short!("init"), symbol_short!("v1")), admin);
+    }
+
     /// Initialize the contract with an admin
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if Self::is_initialized(env.clone()) {
@@ -886,6 +917,122 @@ impl IdentityContract {
         count
     }
 
+    // ── Attestation lifecycle ─────────────────────────────────────────────────
+
+    /// Authorize or de-authorize an issuer for a credential type. Admin only.
+    pub fn set_issuer_auth(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        cred: CredentialType,
+        authorized: bool,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        attestation::set_issuer_auth(&env, &admin, &issuer, cred, authorized)
+    }
+
+    /// Issue an attestation. Issuer must be authorized for this credential type.
+    pub fn attest(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        cred: CredentialType,
+        expires_at: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env)?;
+        attestation::attest(&env, &issuer, &subject, cred, expires_at, evidence_hash)
+    }
+
+    /// Revoke an attestation. Caller must be the original issuer or admin.
+    pub fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        attestation_id: u64,
+        reason_code: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        attestation::revoke(&env, &caller, attestation_id, reason_code)
+    }
+
+    /// Renew/supersede an attestation. Revokes old, mints new with same subject.
+    pub fn renew_attestation(
+        env: Env,
+        issuer: Address,
+        old_attestation_id: u64,
+        new_expires_at: u64,
+        new_evidence_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env)?;
+        attestation::renew(&env, &issuer, old_attestation_id, new_expires_at, new_evidence_hash)
+    }
+
+    /// Flag a rogue issuer and cascade-mark their attestations for review.
+    /// Does NOT auto-revoke — in-flight workflows are unaffected until admin acts.
+    pub fn flag_rogue_issuer(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        attestation_ids: Vec<u64>,
+    ) -> Result<u32, Error> {
+        Self::require_not_paused(&env)?;
+        attestation::flag_rogue_issuer(&env, &admin, &issuer, attestation_ids)
+    }
+
+    /// The single validity predicate consumed by other contracts.
+    /// `allow_grace` requests centrally configured grace; it cannot enable
+    /// grace when the identity administrator has disabled it for `cred`.
+    pub fn is_valid(
+        env: Env,
+        subject: Address,
+        cred: CredentialType,
+        allow_grace: bool,
+    ) -> bool {
+        attestation::is_valid(&env, &subject, cred, allow_grace)
+    }
+
+    /// Paged attestation history for a subject + credential type (max 50/page).
+    pub fn get_attestation_history(
+        env: Env,
+        subject: Address,
+        cred: CredentialType,
+        offset: u64,
+        limit: u32,
+    ) -> AttestationPage {
+        attestation::get_history(&env, &subject, cred, offset, limit)
+    }
+
+    /// Get a single attestation record by ID.
+    pub fn get_attestation(env: Env, attestation_id: u64) -> Option<Attestation> {
+        attestation::get_attestation(&env, attestation_id)
+    }
+
+    /// Set the centrally enforced grace-period policy for a credential type.
+    /// Admin only. Grace is disabled unless `allow_grace` is explicitly enabled.
+    pub fn set_grace_policy(
+        env: Env,
+        admin: Address,
+        cred: CredentialType,
+        grace_seconds: u64,
+        allow_grace: bool,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        attestation::set_grace_policy(&env, &admin, cred, grace_seconds, allow_grace)
+    }
+
+    /// Configure M-of-N quorum for a credential type. Admin only.
+    pub fn set_quorum_config(
+        env: Env,
+        admin: Address,
+        cred: CredentialType,
+        required: u32,
+        total: u32,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        attestation::set_quorum_config(&env, &admin, cred, required, total, enabled)
+    }
+
     // ── Upgradeability & versioned storage schema (#31) ──────────────────────
 
     /// Code version of the currently deployed binary.
@@ -1206,6 +1353,7 @@ impl AccessControlContract {
 
 mod test;
 mod verification;
+mod test_attestation;
 
 // ── Upgradeability & versioned storage schema (#31) ───────────────────────────
 //

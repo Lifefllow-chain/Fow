@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useMemo, useState } from 'react';
-
 import {
   useAssignQuarantineReviewer,
   useFinalizeQuarantineCase,

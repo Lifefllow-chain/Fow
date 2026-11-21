@@ -10,6 +10,7 @@
 /// Any step that finds the prerequisite state missing returns an error and makes
 /// no state changes, providing safe rollback semantics within a single transaction.
 mod error;
+mod events;
 mod types;
 
 #[cfg(test)]
@@ -26,6 +27,9 @@ use lifebank_interfaces::clients::{InventoryContractClient, PaymentContractClien
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
+/// Maximum duration any pause flag may remain active (30 days).
+/// After this window all workflow paths auto-enable even if admin keys are lost.
+pub const MAX_PAUSE_SECS: u64 = 30 * 24 * 3600;
 const ALLOCATION_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
 // ── Storage helpers ────────────────────────────────────────────────────────────
@@ -53,6 +57,65 @@ pub struct CoordinatorContract;
 
 #[contractimpl]
 impl CoordinatorContract {
+    /// Atomic constructor — deploy + init in a single transaction.
+    ///
+    /// soroban-sdk 22+ executes `__constructor` as part of the deploy call,
+    /// eliminating the window between deploy and initialize during which any
+    /// caller could front-run and claim admin by calling `initialize` first.
+    ///
+    /// The separate `initialize` entry-point is kept with an already-initialized
+    /// guard for tooling compatibility, but is a no-op if the constructor ran.
+    #[allow(clippy::too_many_arguments)]
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        request_contract: Address,
+        inventory_contract: Address,
+        payment_contract: Address,
+    ) {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        // Assert that the inventory contract's admin is this coordinator contract,
+        // so update_status calls authorised by inv_admin are actually authorised
+        // by the coordinator itself — not an implicit side-effect of address config.
+        let coord_addr = env.current_contract_address();
+        let inv_admin = InventoryContractClient::new(&env, &inventory_contract).get_admin();
+        if inv_admin != coord_addr {
+            panic!("inventory admin must be set to this coordinator contract address");
+        }
+        let pay_coordinator = PaymentContractClient::new(&env, &payment_contract).get_coordinator();
+        if pay_coordinator != Some(coord_addr.clone()) {
+            panic!("payments coordinator must be set to this coordinator contract address");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::RequestContract, &request_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::InventoryContract, &inventory_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentContract, &payment_contract);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+        env.events().publish(
+            (
+                symbol_short!("coord"),
+                symbol_short!("init"),
+                symbol_short!("v1"),
+            ),
+            admin,
+        );
+    }
+
+    /// Legacy initialize — kept for tooling compatibility.
+    /// Returns `AlreadyInitialized` if the constructor already ran (the
+    /// normal case); otherwise performs first-time initialization so the
+    /// contract can be used without a constructor-aware deployer.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -63,6 +126,16 @@ impl CoordinatorContract {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(CoordinatorError::AlreadyInitialized);
+        }
+        // Same admin-wiring assertion as the constructor.
+        let coord_addr = env.current_contract_address();
+        let inv_admin = InventoryContractClient::new(&env, &inventory_contract).get_admin();
+        if inv_admin != coord_addr {
+            return Err(CoordinatorError::InventoryAdminMismatch);
+        }
+        let pay_coordinator = PaymentContractClient::new(&env, &payment_contract).get_coordinator();
+        if pay_coordinator != Some(coord_addr.clone()) {
+            return Err(CoordinatorError::PaymentCoordinatorMismatch);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -85,8 +158,13 @@ impl CoordinatorContract {
         Ok(())
     }
 
-    /// Pause all state-mutating functions. Admin only.
-    pub fn pause(env: Env, admin: Address) -> Result<(), CoordinatorError> {
+    /// Set the guardian address. Admin only.
+    /// Guardian can pause any flag instantly; only Admin can unpause.
+    pub fn set_guardian(
+        env: Env,
+        admin: Address,
+        guardian: Address,
+    ) -> Result<(), CoordinatorError> {
         admin.require_auth();
         let stored: Address = env
             .storage()
@@ -96,11 +174,137 @@ impl CoordinatorContract {
         if admin != stored {
             return Err(CoordinatorError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::Guardian, &guardian);
+        env.events().publish(
+            (symbol_short!("coord"), symbol_short!("guardian")),
+            guardian,
+        );
         Ok(())
     }
 
-    /// Unpause the contract. Admin only.
+    /// Pause a specific operation flag. Guardian or Admin only.
+    /// `flag`: symbol_short!("alloc") | symbol_short!("dlvr") | symbol_short!("settl").
+    /// Pausing "alloc" does NOT block refund/rollback — exit paths remain open.
+    pub fn pause_flag(
+        env: Env,
+        caller: Address,
+        flag: soroban_sdk::Symbol,
+    ) -> Result<(), CoordinatorError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(CoordinatorError::Unauthorized)?;
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
+            return Err(CoordinatorError::Unauthorized);
+        }
+        Self::validate_flag(&flag)?;
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseFlag(flag.clone()), &now);
+        env.events().publish(
+            (symbol_short!("coord"), symbol_short!("paused")),
+            (flag, now),
+        );
+        Ok(())
+    }
+
+    /// Unpause a specific operation flag. Admin only.
+    /// Unpausing "settl" (settlement/release) requires the timelock to have elapsed.
+    pub fn unpause_flag(
+        env: Env,
+        admin: Address,
+        flag: soroban_sdk::Symbol,
+    ) -> Result<(), CoordinatorError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(CoordinatorError::Unauthorized)?;
+        if admin != stored {
+            return Err(CoordinatorError::Unauthorized);
+        }
+        Self::validate_flag(&flag)?;
+        // Settlement flag is funds-critical: require timelock before unpausing.
+        if flag == symbol_short!("settl") {
+            if let Some(paused_at) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::PauseFlag(flag.clone()))
+            {
+                let now = env.ledger().timestamp();
+                if now < paused_at + UPGRADE_TIMELOCK_SECS {
+                    return Err(CoordinatorError::TimelockNotElapsed);
+                }
+            }
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PauseFlag(flag.clone()));
+        env.events()
+            .publish((symbol_short!("coord"), symbol_short!("unpaused")), flag);
+        Ok(())
+    }
+
+    /// Returns whether a specific flag is currently paused (within safety window).
+    pub fn is_flag_paused(env: Env, flag: soroban_sdk::Symbol) -> bool {
+        Self::flag_is_paused_now(&env, &flag)
+    }
+
+    fn validate_flag(flag: &soroban_sdk::Symbol) -> Result<(), CoordinatorError> {
+        if *flag == symbol_short!("alloc")
+            || *flag == symbol_short!("dlvr")
+            || *flag == symbol_short!("settl")
+        {
+            Ok(())
+        } else {
+            Err(CoordinatorError::UnknownPauseFlag)
+        }
+    }
+
+    fn flag_is_paused_now(env: &Env, flag: &soroban_sdk::Symbol) -> bool {
+        match env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::PauseFlag(flag.clone()))
+        {
+            None => false,
+            Some(paused_at) => {
+                let now = env.ledger().timestamp();
+                now < paused_at + MAX_PAUSE_SECS
+            }
+        }
+    }
+
+    /// Legacy single-flag pause — pauses the "alloc" flag only.
+    /// Rollback and expire remain callable. Admin or Guardian only.
+    pub fn pause(env: Env, admin: Address) -> Result<(), CoordinatorError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(CoordinatorError::Unauthorized)?;
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        if admin != stored && guardian.as_ref() != Some(&admin) {
+            return Err(CoordinatorError::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseFlag(symbol_short!("alloc")), &now);
+        env.events().publish(
+            (symbol_short!("coord"), symbol_short!("paused")),
+            (symbol_short!("alloc"), now),
+        );
+        Ok(())
+    }
+
+    /// Legacy single-flag unpause — unpauses the "alloc" flag. Admin only.
     pub fn unpause(env: Env, admin: Address) -> Result<(), CoordinatorError> {
         admin.require_auth();
         let stored: Address = env
@@ -111,25 +315,23 @@ impl CoordinatorContract {
         if admin != stored {
             return Err(CoordinatorError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PauseFlag(symbol_short!("alloc")));
+        env.events().publish(
+            (symbol_short!("coord"), symbol_short!("unpaused")),
+            symbol_short!("alloc"),
+        );
         Ok(())
     }
 
-    /// Returns whether the contract is currently paused.
+    /// Returns true if the "alloc" flag is paused (legacy compat).
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        Self::flag_is_paused_now(&env, &symbol_short!("alloc"))
     }
 
     fn require_not_paused(env: &Env) -> Result<(), CoordinatorError> {
-        if env
-            .storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
+        if Self::flag_is_paused_now(env, &symbol_short!("alloc")) {
             return Err(CoordinatorError::ContractPaused);
         }
         Ok(())
@@ -145,11 +347,30 @@ impl CoordinatorContract {
     ) -> Result<(), CoordinatorError> {
         caller.require_auth();
         Self::require_initialized(&env)?;
-        Self::require_not_paused(&env)?;
+        if Self::flag_is_paused_now(&env, &symbol_short!("alloc")) {
+            return Err(CoordinatorError::ContractPaused);
+        }
         Self::require_compatible_domain_contracts(&env)?;
 
         if load_workflow(&env, request_id).is_some() {
             return Err(CoordinatorError::AlreadyDone);
+        }
+
+        // Re-check facility credential at allocation time (may have expired since request).
+        // Uses caller as the facility subject — caller must hold MedicalFacilityLicense.
+        if let Some(identity_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::IdentityContract)
+        {
+            let id_client = IdentityContractClient::new(&env, &identity_addr);
+            let credentialed = id_client
+                .try_is_valid(&caller, &CredentialType::MedicalFacilityLicense, &false)
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+            if !credentialed {
+                return Err(CoordinatorError::Unauthorized);
+            }
         }
 
         // Verify request is Pending
@@ -168,14 +389,15 @@ impl CoordinatorContract {
             return Err(CoordinatorError::InvalidRequestState);
         }
 
-        // Reserve each inventory unit
+        // Validate every unit is Available and compatible with the request's
+        // blood type before reserving anything — reserve_blood itself has no
+        // notion of blood type, so this check must stay here.
         let inv_addr: Address = env
             .storage()
             .instance()
             .get(&DataKey::InventoryContract)
             .unwrap();
         let inv_client = InventoryContractClient::new(&env, &inv_addr);
-        let inv_admin = inv_client.get_admin();
 
         for i in 0..unit_ids.len() {
             let uid = unit_ids.get(i).unwrap();
@@ -188,11 +410,27 @@ impl CoordinatorContract {
                 return Err(CoordinatorError::UnitNotAvailable);
             }
 
-            inv_client
-                .try_update_status(&uid, &BloodStatus::Reserved, &inv_admin, &None)
-                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
-                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+            if !is_compatible(unit.blood_type, request.blood_type) {
+                return Err(CoordinatorError::IncompatibleBloodType);
+            }
         }
+
+        // Reserve the whole batch atomically through inventory's Reservation
+        // record — the single source of truth for "who holds these units and
+        // until when." The coordinator's own contract address is both the
+        // inventory admin (asserted at init) and, by that same equality, an
+        // authorized requester, so this self-authorizes exactly like the
+        // inv_admin passthrough used elsewhere in this contract.
+        let coord_addr = env.current_contract_address();
+        let reservation_id = inv_client
+            .try_reserve_blood(
+                &coord_addr,
+                &unit_ids,
+                &request_id,
+                &ALLOCATION_EXPIRY_SECONDS,
+            )
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
 
         env.events().publish(
             (
@@ -211,7 +449,7 @@ impl CoordinatorContract {
                 unit_ids,
                 status: WorkflowStatus::Allocated,
                 delivery_confirmed: false,
-                allocation_deadline: env.ledger().timestamp() + ALLOCATION_EXPIRY_SECONDS,
+                reservation_id,
             },
         );
 
@@ -226,7 +464,9 @@ impl CoordinatorContract {
     ) -> Result<(), CoordinatorError> {
         caller.require_auth();
         Self::require_initialized(&env)?;
-        Self::require_not_paused(&env)?;
+        if Self::flag_is_paused_now(&env, &symbol_short!("dlvr")) {
+            return Err(CoordinatorError::ContractPaused);
+        }
         Self::require_compatible_domain_contracts(&env)?;
 
         let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
@@ -246,6 +486,23 @@ impl CoordinatorContract {
             .unwrap();
         let inv_client = InventoryContractClient::new(&env, &inv_addr);
         let inv_admin = inv_client.get_admin();
+
+        // Extend the reservation deadline by the pause duration so users are
+        // not penalised — the reservation record in inventory is the sole
+        // place this deadline lives, so extend it there rather than tracking
+        // a second, competing deadline in WorkflowRecord.
+        if let Some(paused_at) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::PauseFlag(symbol_short!("dlvr")))
+        {
+            let pause_duration = env.ledger().timestamp().saturating_sub(paused_at);
+            inv_client
+                .try_extend_reservation(&wf.reservation_id, &pause_duration, &inv_admin)
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+        }
+
         let location = soroban_sdk::String::from_str(&env, "delivered");
 
         for i in 0..wf.unit_ids.len() {
@@ -285,7 +542,9 @@ impl CoordinatorContract {
     ) -> Result<(), CoordinatorError> {
         caller.require_auth();
         Self::require_initialized(&env)?;
-        Self::require_not_paused(&env)?;
+        if Self::flag_is_paused_now(&env, &symbol_short!("settl")) {
+            return Err(CoordinatorError::ContractPaused);
+        }
         Self::require_compatible_domain_contracts(&env)?;
 
         let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
@@ -315,7 +574,7 @@ impl CoordinatorContract {
         }
 
         pay_client
-            .try_update_status(&wf.payment_id, &PaymentStatus::Released)
+            .try_release_escrow(&env.current_contract_address(), &wf.payment_id)
             .map_err(|_| CoordinatorError::PaymentUpdateFailed)?
             .map_err(|_| CoordinatorError::PaymentUpdateFailed)?;
 
@@ -354,31 +613,26 @@ impl CoordinatorContract {
             return Err(CoordinatorError::InvalidWorkflowState);
         }
 
-        if env.ledger().timestamp() < wf.allocation_deadline {
-            return Err(CoordinatorError::WorkflowNotExpired);
-        }
-
         let inv_addr: Address = env
             .storage()
             .instance()
             .get(&DataKey::InventoryContract)
             .unwrap();
         let inv_client = InventoryContractClient::new(&env, &inv_addr);
-        let inv_admin = inv_client.get_admin();
-        let reason = String::from_str(&env, "workflow_expired");
 
-        for i in 0..wf.unit_ids.len() {
-            let uid = wf.unit_ids.get(i).unwrap();
-            inv_client
-                .try_update_status(
-                    &uid,
-                    &BloodStatus::Available,
-                    &inv_admin,
-                    &Some(reason.clone()),
-                )
-                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
-                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+        let reservation = inv_client
+            .try_get_reservation(&wf.reservation_id)
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+
+        if env.ledger().timestamp() < reservation.expiration_timestamp {
+            return Err(CoordinatorError::WorkflowNotExpired);
         }
+
+        inv_client
+            .try_release_reservation(&wf.reservation_id)
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+            .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
 
         let pay_addr: Address = env
             .storage()
@@ -387,7 +641,7 @@ impl CoordinatorContract {
             .unwrap();
         let pay_client = PaymentContractClient::new(&env, &pay_addr);
         pay_client
-            .try_update_status(&wf.payment_id, &PaymentStatus::Refunded)
+            .try_refund_escrow(&env.current_contract_address(), &wf.payment_id)
             .map_err(|_| CoordinatorError::PaymentUpdateFailed)?
             .map_err(|_| CoordinatorError::PaymentUpdateFailed)?;
 
@@ -408,10 +662,13 @@ impl CoordinatorContract {
     }
 
     /// Rollback – admin only. Releases units and refunds payment.
+    ///
+    /// Deliberately not gated by any pause flag: rollback is the canonical
+    /// exit path and must remain callable under every pause combination
+    /// (see `pause_flag`'s doc and `test_exit_always_invariant_over_flag_lattice`).
     pub fn rollback(env: Env, request_id: u64) -> Result<(), CoordinatorError> {
         get_admin(&env).require_auth();
         Self::require_initialized(&env)?;
-        Self::require_not_paused(&env)?;
         Self::require_compatible_domain_contracts(&env)?;
 
         let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
@@ -426,12 +683,11 @@ impl CoordinatorContract {
             .get(&DataKey::InventoryContract)
             .unwrap();
         let inv_client = InventoryContractClient::new(&env, &inv_addr);
-        let inv_admin = inv_client.get_admin();
-
-        for i in 0..wf.unit_ids.len() {
-            let uid = wf.unit_ids.get(i).unwrap();
-            let _ = inv_client.try_update_status(&uid, &BloodStatus::Available, &inv_admin, &None);
-        }
+        // Best-effort, same as before: a workflow may have progressed past
+        // Allocated (units no longer Reserved), so release_reservation's
+        // per-unit "only touch Reserved units" guard makes this a safe no-op
+        // for units that already moved on.
+        let _ = inv_client.try_release_reservation(&wf.reservation_id);
 
         let pay_addr: Address = env
             .storage()
@@ -441,7 +697,7 @@ impl CoordinatorContract {
         let pay_client = PaymentContractClient::new(&env, &pay_addr);
         if let Ok(Ok(payment)) = pay_client.try_get_payment(&wf.payment_id) {
             if payment.status == PaymentStatus::Locked {
-                let _ = pay_client.try_update_status(&wf.payment_id, &PaymentStatus::Refunded);
+                let _ = pay_client.try_refund_escrow(&env.current_contract_address(), &wf.payment_id);
             }
         }
 
@@ -503,6 +759,7 @@ impl CoordinatorContract {
 
         pay_client
             .try_record_dispute(
+                &env.current_contract_address(),
                 &payment_id,
                 &DisputeReason::TemperatureExcursion,
                 &case_id,
@@ -594,10 +851,7 @@ impl CoordinatorContract {
             executable_at: now + UPGRADE_TIMELOCK_SECS,
         };
         env.storage().instance().set(&PENDING_UPGRADE_KEY, &pending);
-        env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("proposed")),
-            pending.executable_at,
-        );
+        events::emit_upgrade_proposed(&env, pending.executable_at);
         Ok(pending.executable_at)
     }
 
@@ -613,8 +867,7 @@ impl CoordinatorContract {
             return Err(CoordinatorError::NoPendingUpgrade);
         }
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
-        env.events()
-            .publish((symbol_short!("upgrade"), symbol_short!("canceled")), ());
+        events::emit_upgrade_canceled(&env);
         Ok(())
     }
 
@@ -644,7 +897,8 @@ impl CoordinatorContract {
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         env.events()
             .publish((symbol_short!("upgrade"), symbol_short!("executed")), ());
-        env.deployer().update_current_contract_wasm(pending.new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash);
         Ok(())
     }
 

@@ -6,11 +6,11 @@ import {
   TableBody,
   TableCell,
   TableHead,
-  TableHeader,
+  TableHeaderCell,
   TableRow,
-} from '@/components/ui/table';
-import { Card, CardContent } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+} from '@/components/ui/Table';
+import { Card, CardContent } from '@/components/ui/Card';
+import { Badge } from '@/components/ui/Badge';
 import { format } from 'date-fns';
 
 interface ReportingTableProps {
@@ -35,15 +35,15 @@ export function ReportingTable({ data, isLoading }: ReportingTableProps) {
         <span className="w-2 h-2 rounded-full bg-blue-500" /> Donors ({donors.length})
       </h3>
       <Table>
-        <TableHeader>
+        <TableHead>
           <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Email</TableHead>
-            <TableHead>Region</TableHead>
-            <TableHead>Blood Type</TableHead>
-            <TableHead>Joined</TableHead>
+            <TableHeaderCell>Name</TableHeaderCell>
+            <TableHeaderCell>Email</TableHeaderCell>
+            <TableHeaderCell>Region</TableHeaderCell>
+            <TableHeaderCell>Blood Type</TableHeaderCell>
+            <TableHeaderCell>Joined</TableHeaderCell>
           </TableRow>
-        </TableHeader>
+        </TableHead>
         <TableBody>
           {donors.map((donor) => (
             <TableRow key={donor.id} className="hover:bg-slate-50 transition-colors">
@@ -71,15 +71,15 @@ export function ReportingTable({ data, isLoading }: ReportingTableProps) {
         <span className="w-2 h-2 rounded-full bg-red-500" /> Blood Units ({units.length})
       </h3>
       <Table>
-        <TableHeader>
+        <TableHead>
           <TableRow>
-            <TableHead>Unit Code</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Component</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Expires</TableHead>
+            <TableHeaderCell>Unit Code</TableHeaderCell>
+            <TableHeaderCell>Type</TableHeaderCell>
+            <TableHeaderCell>Component</TableHeaderCell>
+            <TableHeaderCell>Status</TableHeaderCell>
+            <TableHeaderCell>Expires</TableHeaderCell>
           </TableRow>
-        </TableHeader>
+        </TableHead>
         <TableBody>
           {units.map((unit) => (
             <TableRow key={unit.id} className="hover:bg-slate-50 transition-colors">
@@ -109,15 +109,15 @@ export function ReportingTable({ data, isLoading }: ReportingTableProps) {
         <span className="w-2 h-2 rounded-full bg-green-500" /> Market Orders ({orders.length})
       </h3>
       <Table>
-        <TableHeader>
+        <TableHead>
           <TableRow>
-            <TableHead>Order ID</TableHead>
-            <TableHead>Blood Type</TableHead>
-            <TableHead>Quantity</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Date</TableHead>
+            <TableHeaderCell>Order ID</TableHeaderCell>
+            <TableHeaderCell>Blood Type</TableHeaderCell>
+            <TableHeaderCell>Quantity</TableHeaderCell>
+            <TableHeaderCell>Status</TableHeaderCell>
+            <TableHeaderCell>Date</TableHeaderCell>
           </TableRow>
-        </TableHeader>
+        </TableHead>
         <TableBody>
           {orders.map((order) => (
             <TableRow key={order.id} className="hover:bg-slate-50 transition-colors">

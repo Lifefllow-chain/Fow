@@ -1,6 +1,7 @@
 #![no_std]
 
 mod error;
+mod events;
 mod storage;
 mod types;
 
@@ -26,6 +27,18 @@ pub trait CoordinatorContractInterface {
 
 #[contractimpl]
 impl TemperatureContract {
+    /// Atomic constructor — deploy + init in a single transaction.
+    pub fn __constructor(env: Env, admin: Address) {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        storage::set_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+    }
+
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         admin.require_auth();
 
@@ -350,8 +363,12 @@ impl TemperatureContract {
         let streak_key = DataKey::ConsecutiveViolationStreak(unit_id);
         let compromised_key = DataKey::IsCompromised(unit_id);
 
+        let previous_streak: u32 = env.storage().persistent().get(&streak_key).unwrap_or(0);
+
         env.storage().persistent().set(&streak_key, &0u32);
         env.storage().persistent().set(&compromised_key, &false);
+
+        events::emit_compromised_status_reset(&env, unit_id, &admin, previous_streak);
 
         Ok(())
     }
@@ -372,6 +389,7 @@ impl TemperatureContract {
         env.storage()
             .instance()
             .set(&DataKey::CoordinatorContract, &coordinator);
+        events::emit_coordinator_set(&env, &admin, &coordinator);
         Ok(())
     }
 
@@ -388,7 +406,8 @@ impl TemperatureContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::OracleWhitelist(oracle), &true);
+            .set(&DataKey::OracleWhitelist(oracle.clone()), &true);
+        events::emit_oracle_added(&env, &admin, &oracle);
         Ok(())
     }
 

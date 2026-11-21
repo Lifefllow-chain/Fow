@@ -1,6 +1,7 @@
 #![no_std]
 
 mod error;
+mod events;
 mod matching;
 mod types;
 
@@ -8,7 +9,9 @@ mod types;
 mod test;
 
 pub use error::MatchingError;
-pub use matching::{compatible_donor_types, is_compatible, score_unit, select_units, sort_by_expiration};
+pub use matching::{
+    compatible_donor_types, is_compatible, score_unit, select_units, sort_by_expiration,
+};
 pub use types::{DataKey, MatchKind, MatchResult, MatchedUnit};
 
 // Shared cross-contract types — single source of truth from the interfaces crate.
@@ -18,12 +21,29 @@ pub use lifebank_interfaces::{
 
 use soroban_sdk::{contract, contractclient, contractimpl, Address, Env, Vec};
 
+// Credential type mirrored from identity contract (no cross-crate dep needed).
+#[soroban_sdk::contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialType {
+    MedicalFacilityLicense,
+    RiderCertification,
+    BloodBankAccreditation,
+    DonorEligibility,
+    LabAccreditation,
+}
+
 // ---------------------------------------------------------------------------
 // Cross-contract client interfaces (generated from shared trait definitions)
 // ---------------------------------------------------------------------------
 
 // Use the shared client structs generated from the interface crate's trait definitions.
 use lifebank_interfaces::clients::{InventoryContractClient, RequestContractClient};
+
+/// Minimal interface to the identity contract for credential gating.
+#[contractclient(name = "IdentityContractClient")]
+pub trait IdentityContractInterface {
+    fn is_valid(env: Env, subject: Address, cred: CredentialType, allow_grace: bool) -> bool;
+}
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -35,6 +55,32 @@ pub struct MatchingContract;
 #[contractimpl]
 impl MatchingContract {
     // ── Lifecycle ────────────────────────────────────────────────────────────
+
+    /// Atomic constructor — deploy + init in a single transaction.
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        inventory_contract: Address,
+        requests_contract: Address,
+    ) {
+        admin.require_auth();
+        if env.storage().instance().has(&DataKey::Initialized) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::InventoryContract, &inventory_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::RequestsContract, &requests_contract);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+
+        events::emit_initialized(&env, &admin, &inventory_contract, &requests_contract);
+    }
 
     pub fn initialize(
         env: Env,
@@ -124,10 +170,7 @@ impl MatchingContract {
     ///    c. Within each tier, applies FIFO (oldest expiration first).
     ///    d. Supports partial matching — returns whatever is available.
     /// 5. Return a `MatchResult` with scores and partial-fulfillment flag.
-    pub fn match_request(
-        env: Env,
-        request_id: u64,
-    ) -> Result<MatchResult, MatchingError> {
+    pub fn match_request(env: Env, request_id: u64) -> Result<MatchResult, MatchingError> {
         Self::require_initialized(&env)?;
         Self::require_not_paused(&env)?;
 
@@ -147,6 +190,26 @@ impl MatchingContract {
             return Err(MatchingError::InvalidRequest);
         }
 
+        // Gate: hospital must hold a valid MedicalFacilityLicense.
+        if let Some(identity_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::IdentityContract)
+        {
+            let id_client = IdentityContractClient::new(&env, &identity_addr);
+            let credentialed = id_client
+                .try_is_valid(
+                    &request.hospital_id,
+                    &CredentialType::MedicalFacilityLicense,
+                    &false,
+                )
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+            if !credentialed {
+                return Err(MatchingError::Unauthorized);
+            }
+        }
+
         // Collect all candidate units across compatible blood types
         let inv_addr: Address = env
             .storage()
@@ -155,8 +218,7 @@ impl MatchingContract {
             .unwrap();
         let inv_client = InventoryContractClient::new(&env, &inv_addr);
 
-        let compatible_types =
-            compatible_donor_types(&env, request.blood_type);
+        let compatible_types = compatible_donor_types(&env, request.blood_type);
 
         let mut candidates: Vec<BloodUnit> = Vec::new(&env);
         for i in 0..compatible_types.len() {
@@ -281,11 +343,7 @@ impl MatchingContract {
     }
 
     /// Check whether `donor` can donate to `recipient`.
-    pub fn check_compatibility(
-        _env: Env,
-        donor: BloodType,
-        recipient: BloodType,
-    ) -> bool {
+    pub fn check_compatibility(_env: Env, donor: BloodType, recipient: BloodType) -> bool {
         is_compatible(donor, recipient)
     }
 

@@ -1,11 +1,15 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
 };
+
+mod events;
 
 const DEFAULT_MIN_TEMPERATURE_C: i32 = 2;
 const DEFAULT_MAX_TEMPERATURE_C: i32 = 6;
+/// ~24 hours at 5 seconds per ledger.
+const DEFAULT_CONFIRMATION_WINDOW_LEDGERS: u32 = 17_280;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -32,6 +36,29 @@ pub struct ProofRequirements {
     pub requires_temperature_log: bool,
 }
 
+/// Lifecycle of a two-phase proof commitment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryStatus {
+    Submitted,
+    Confirmed,
+    ContestableTimeout,
+}
+
+/// Cryptographic commitment binding an on-chain delivery to the off-chain
+/// evidence bundle assembled by the backend proof-bundle module.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofCommitment {
+    pub delivery_id: u64,
+    pub bundle_hash: BytesN<32>,
+    pub courier: Address,
+    pub facility: Address,
+    pub submitted_at: u64,
+    pub confirmed_at: Option<u64>,
+    pub status: DeliveryStatus,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -40,14 +67,61 @@ pub enum DataKey {
     DeliveryCounter,
     TemperatureThresholds,
     ProofRequirements,
+    ConfirmationWindow,
     ComplianceAttestation(u64),
+    ProofCommitment(u64),
 }
 
 #[contract]
 pub struct DeliveryContract;
 
+fn do_delivery_init(env: &Env, admin: Address, request_contract: Address) {
+    let thresholds = TemperatureThresholds {
+        min_celsius: DEFAULT_MIN_TEMPERATURE_C,
+        max_celsius: DEFAULT_MAX_TEMPERATURE_C,
+    };
+    let proof_requirements = ProofRequirements {
+        requires_photo_proof: true,
+        requires_recipient_signature: true,
+        requires_temperature_log: true,
+    };
+
+    env.storage().instance().set(&DataKey::Admin, &admin);
+    env.storage()
+        .instance()
+        .set(&DataKey::RequestContract, &request_contract);
+    env.storage()
+        .instance()
+        .set(&DataKey::DeliveryCounter, &0u64);
+    env.storage()
+        .instance()
+        .set(&DataKey::TemperatureThresholds, &thresholds);
+    env.storage()
+        .instance()
+        .set(&DataKey::ProofRequirements, &proof_requirements);
+    env.storage().instance().set(
+        &DataKey::ConfirmationWindow,
+        &DEFAULT_CONFIRMATION_WINDOW_LEDGERS,
+    );
+    env.storage()
+        .instance()
+        .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+
+    events::emit_initialized(env, &admin, &request_contract);
+}
+
 #[contractimpl]
 impl DeliveryContract {
+    /// Atomic constructor — deploy + init in a single transaction.
+    pub fn __constructor(env: Env, admin: Address, request_contract: Address) {
+        admin.require_auth();
+        if Self::is_initialized(env.clone()) {
+            panic!("already initialized");
+        }
+        do_delivery_init(&env, admin, request_contract);
+    }
+
+    #[allow(deprecated)] // events pending migration to #[contractevent]
     pub fn initialize(env: Env, admin: Address, request_contract: Address) -> Result<(), Error> {
         admin.require_auth();
 
@@ -55,35 +129,7 @@ impl DeliveryContract {
             return Err(Error::AlreadyInitialized);
         }
 
-        let thresholds = TemperatureThresholds {
-            min_celsius: DEFAULT_MIN_TEMPERATURE_C,
-            max_celsius: DEFAULT_MAX_TEMPERATURE_C,
-        };
-        let proof_requirements = ProofRequirements {
-            requires_photo_proof: true,
-            requires_recipient_signature: true,
-            requires_temperature_log: true,
-        };
-
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::RequestContract, &request_contract);
-        env.storage()
-            .instance()
-            .set(&DataKey::DeliveryCounter, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::TemperatureThresholds, &thresholds);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProofRequirements, &proof_requirements);
-
-        env.events().publish(
-            (symbol_short!("init"), symbol_short!("v1")),
-            (admin, request_contract),
-        );
-
+        do_delivery_init(&env, admin, request_contract);
         Ok(())
     }
 
@@ -128,6 +174,7 @@ impl DeliveryContract {
 
     /// Record a compliance attestation hash for a completed delivery.
     /// The hash is produced off-chain by the backend after evaluating telemetry.
+    #[allow(deprecated)] // events pending migration to #[contractevent]
     pub fn record_compliance_attestation(
         env: Env,
         admin: Address,

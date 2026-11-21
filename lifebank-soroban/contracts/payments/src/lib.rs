@@ -1,12 +1,35 @@
 #![no_std]
 use soroban_sdk::token;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Vec,
 };
 
 // Cross-contract types — single source of truth from the interfaces crate.
 pub use lifebank_interfaces::{DisputeReason, Payment, PaymentStatus};
+
+// Credential type mirrored from identity contract.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialType {
+    MedicalFacilityLicense,
+    RiderCertification,
+    BloodBankAccreditation,
+    DonorEligibility,
+    LabAccreditation,
+}
+
+mod identity_client {
+    use super::CredentialType;
+    use soroban_sdk::{contractclient, Address, Env};
+
+    #[contractclient(name = "IdentityContractClient")]
+    pub trait IdentityContractInterface {
+        fn is_valid(env: Env, subject: Address, cred: CredentialType, allow_grace: bool) -> bool;
+    }
+}
+
+use identity_client::IdentityContractClient;
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
     match reason {
@@ -77,7 +100,10 @@ pub enum Error {
     NotPledgeDonor = 504,
     InsufficientEscrowFunds = 505,
     Unauthorized = 506,
+    /// The specific operation flag is paused (granular circuit-breaker).
     ContractPaused = 507,
+    /// The requested pause flag does not exist.
+    UnknownPauseFlag = 530,
     CliffNotReached = 508,
     VestingNotFound = 509,
     NothingToClaim = 510,
@@ -101,6 +127,10 @@ pub enum Error {
     NoPendingUpgrade = 519,
     /// The upgrade timelock window has not elapsed yet.
     TimelockNotElapsed = 520,
+    /// A batch exceeds the maximum entries accepted in one transaction.
+    BatchTooLarge = 521,
+    /// `resolve_dispute` was called on a payment that is not Disputed.
+    PaymentNotDisputed = 522,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -108,18 +138,40 @@ pub enum Error {
 const PAYMENT_COUNTER: soroban_sdk::Symbol = symbol_short!("PAY_CTR");
 const PLEDGE_COUNTER: soroban_sdk::Symbol = symbol_short!("PLG_CTR");
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
-const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
+/// Guardian address — can pause any flag instantly (break-glass).
+const GUARDIAN_KEY: soroban_sdk::Symbol = symbol_short!("GUARDIAN");
+/// Coordinator contract address — additive to ADMIN_KEY, not a replacement.
+/// Authorizes only `release_escrow`, `refund_escrow`, `record_dispute`, and
+/// `resolve_dispute` (workflow settlement), leaving every other admin-gated
+/// entry point (pause, dispute-timeout, vesting, upgrades) controlled solely
+/// by the human/multisig admin even when a coordinator is wired in.
+const COORDINATOR_KEY: soroban_sdk::Symbol = symbol_short!("COORD");
+// ── Granular pause flags ───────────────────────────────────────────────────────
+// Pausing `lock` must NOT block `release`, `refund`, or `dispute`.
+// Each flag is stored as Option<u64> — None = not paused, Some(ts) = paused_at.
+const PAUSE_LOCK: soroban_sdk::Symbol = symbol_short!("P_LOCK");
+const PAUSE_RELEASE: soroban_sdk::Symbol = symbol_short!("P_REL");
+const PAUSE_DISPUTE: soroban_sdk::Symbol = symbol_short!("P_DISP");
+/// Maximum duration any flag may remain paused (30 days).
+/// After this window refund/dispute paths auto-enable regardless of admin keys.
+pub const MAX_PAUSE_SECS: u64 = 30 * 24 * 3600;
 const REWARD_TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("RWD_TOK");
-/// Instance-level map: request_id (u64) → payment_id (u64).
-const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
 /// Instance-level aggregate stats.
 const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
 /// Instance storage key for the requests contract address (optional).
 const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
+/// Instance storage key for the identity contract address (optional).
+const IDENTITY_CONTRACT: soroban_sdk::Symbol = symbol_short!("ID_CTR");
 /// Default dispute auto-refund timeout in seconds (7 days).
 const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 /// Instance storage key for the dispute timeout override.
 const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
+/// Maximum IDs stored in one enumeration index entry.
+pub const INDEX_PAGE_SIZE: u32 = 100;
+/// Maximum payments accepted by one batch call.
+pub const MAX_BATCH_PAYMENTS: u32 = 100;
+/// Maximum records returned by one pagination call.
+pub const MAX_PAGE_SIZE: u32 = 100;
 
 fn payment_key(id: u64) -> (u64, &'static str) {
     (id, "pay")
@@ -129,24 +181,55 @@ fn pledge_key(id: u64) -> (u64, &'static str) {
     (id, "plg")
 }
 
-fn payer_index_key(payer: &Address) -> (Address, &'static str) {
-    (payer.clone(), "pi")
+fn payer_index_page_key(payer: &Address, page: u32) -> (Address, u32, &'static str) {
+    (payer.clone(), page, "pip")
 }
 
-fn payee_index_key(payee: &Address) -> (Address, &'static str) {
-    (payee.clone(), "pyi")
+fn payee_index_page_key(payee: &Address, page: u32) -> (Address, u32, &'static str) {
+    (payee.clone(), page, "pyp")
 }
 
-fn status_index_key(status: PaymentStatus) -> (u32, &'static str) {
-    let code = match status {
-        PaymentStatus::Pending => 0u32,
+fn status_index_page_key(status: PaymentStatus, page: u32) -> (u32, u32, &'static str) {
+    (status_index_code(status), page, "sip")
+}
+
+fn status_index_code(status: PaymentStatus) -> u32 {
+    match status {
+        PaymentStatus::Pending => 0,
         PaymentStatus::Locked => 1,
         PaymentStatus::Released => 2,
         PaymentStatus::Refunded => 3,
         PaymentStatus::Disputed => 4,
         PaymentStatus::Cancelled => 5,
-    };
-    (code, "si")
+    }
+}
+
+fn payer_index_count_key(payer: &Address) -> (Address, &'static str) {
+    (payer.clone(), "pic")
+}
+
+fn payee_index_count_key(payee: &Address) -> (Address, &'static str) {
+    (payee.clone(), "pyc")
+}
+
+fn status_index_count_key(status: PaymentStatus) -> (u32, &'static str) {
+    (status_index_code(status), "sic")
+}
+
+fn status_position_key(payment_id: u64) -> (u64, &'static str) {
+    (payment_id, "spos")
+}
+
+fn request_payment_key(request_id: u64) -> (u64, &'static str) {
+    (request_id, "reqp")
+}
+
+fn normalized_page_size(page_size: u32) -> u32 {
+    if page_size == 0 {
+        20
+    } else {
+        page_size.min(MAX_PAGE_SIZE)
+    }
 }
 
 fn get_counter(env: &Env) -> u64 {
@@ -208,64 +291,100 @@ fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
 // ── Index helpers ──────────────────────────────────────────────────────────────
 
 fn index_by_payer(env: &Env, payer: &Address, id: u64) {
-    let key = payer_index_key(payer);
+    let count_key = payer_index_count_key(payer);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let page_key = payer_index_page_key(payer, count / INDEX_PAGE_SIZE);
     let mut ids: Vec<u64> = env
         .storage()
         .persistent()
-        .get(&key)
+        .get(&page_key)
         .unwrap_or(Vec::new(env));
     ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().set(&page_key, &ids);
+    env.storage().persistent().set(&count_key, &(count + 1));
 }
 
 fn index_by_payee(env: &Env, payee: &Address, id: u64) {
-    let key = payee_index_key(payee);
+    let count_key = payee_index_count_key(payee);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let page_key = payee_index_page_key(payee, count / INDEX_PAGE_SIZE);
     let mut ids: Vec<u64> = env
         .storage()
         .persistent()
-        .get(&key)
+        .get(&page_key)
         .unwrap_or(Vec::new(env));
     ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().set(&page_key, &ids);
+    env.storage().persistent().set(&count_key, &(count + 1));
 }
 
 fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
-    let key = status_index_key(status);
+    let count_key = status_index_count_key(status);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    let page_key = status_index_page_key(status, count / INDEX_PAGE_SIZE);
     let mut ids: Vec<u64> = env
         .storage()
         .persistent()
-        .get(&key)
+        .get(&page_key)
         .unwrap_or(Vec::new(env));
     ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().set(&page_key, &ids);
+    env.storage()
+        .persistent()
+        .set(&status_position_key(id), &(count, status));
+    env.storage().persistent().set(&count_key, &(count + 1));
 }
 
 fn index_by_request(env: &Env, request_id: u64, payment_id: u64) {
-    let mut map: Map<u64, u64> = env
-        .storage()
-        .instance()
-        .get(&REQ_IDX)
-        .unwrap_or(Map::new(env));
-    map.set(request_id, payment_id);
-    env.storage().instance().set(&REQ_IDX, &map);
+    env.storage()
+        .persistent()
+        .set(&request_payment_key(request_id), &payment_id);
 }
 
-/// Remove `id` from the persistent Vec stored under the given status index key.
+/// Remove a status index entry with a bounded swap-with-last operation.
 fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
-    let key = status_index_key(status);
-    let ids: Vec<u64> = env
+    let (position, stored_status): (u32, PaymentStatus) = env
         .storage()
         .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    let mut new_ids: Vec<u64> = Vec::new(env);
-    for i in 0..ids.len() {
-        let existing = ids.get(i).unwrap();
-        if existing != id {
-            new_ids.push_back(existing);
-        }
+        .get(&status_position_key(id))
+        .unwrap();
+    if stored_status != status {
+        return;
     }
-    env.storage().persistent().set(&key, &new_ids);
+    let count_key = status_index_count_key(status);
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+    let last_position = count - 1;
+    let last_page_key = status_index_page_key(status, last_position / INDEX_PAGE_SIZE);
+    let mut last_page: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&last_page_key)
+        .unwrap_or(Vec::new(env));
+    let last_id = last_page.get(last_page.len() - 1).unwrap();
+    if position != last_position {
+        let target_page_key = status_index_page_key(status, position / INDEX_PAGE_SIZE);
+        let mut target_page: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&target_page_key)
+            .unwrap();
+        target_page.set(position % INDEX_PAGE_SIZE, last_id);
+        env.storage().persistent().set(&target_page_key, &target_page);
+        env.storage()
+            .persistent()
+            .set(&status_position_key(last_id), &(position, status));
+    }
+    last_page.pop_back();
+    if last_page.len() == 0 {
+        env.storage().persistent().remove(&last_page_key);
+    } else {
+        env.storage().persistent().set(&last_page_key, &last_page);
+    }
+    env.storage().persistent().set(&count_key, &last_position);
+    env.storage().persistent().remove(&status_position_key(id));
 }
 
 // ── Stats helpers ──────────────────────────────────────────────────────────────
@@ -394,8 +513,29 @@ pub struct PaymentContract;
 
 #[contractimpl]
 impl PaymentContract {
-    /// Initialize the contract. Optionally provide the address of the requests
-    /// contract so that payment creation can validate request state.
+    /// Atomic constructor — deploy + init in a single transaction.
+    ///
+    /// Eliminates the front-running window that existed when deploy and
+    /// initialize were separate calls.  The legacy `initialize` entry-point
+    /// remains for tooling that is not yet constructor-aware but is a no-op
+    /// once the constructor has run.
+    pub fn __constructor(env: Env, admin: Address, requests_contract: Option<Address>) {
+        admin.require_auth();
+        if env.storage().instance().has(&ADMIN_KEY) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&ADMIN_KEY, &admin);
+        if let Some(rc) = requests_contract {
+            env.storage().instance().set(&REQ_CONTRACT, &rc);
+        }
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &TARGET_SCHEMA_VERSION);
+    }
+
+    /// Legacy initialize — kept for tooling compatibility.
+    /// Returns `Unauthorized` (reuses the closest existing error code) if the
+    /// constructor already ran; otherwise performs first-time initialization.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -412,6 +552,136 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Set the guardian address. Admin only.
+    /// The guardian can pause any flag instantly (break-glass) but cannot unpause.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&GUARDIAN_KEY, &guardian);
+        env.events().publish(
+            (symbol_short!("pause"), symbol_short!("guardian")),
+            guardian,
+        );
+        Ok(())
+    }
+
+    /// Pause a specific operation flag. Guardian or Admin only.
+    /// `flag`: symbol_short!("lock") | symbol_short!("release") | symbol_short!("dispute").
+    /// Pausing "lock" does NOT block refunds or disputes — exit paths remain open.
+    pub fn pause_flag(
+        env: Env,
+        caller: Address,
+        flag: soroban_sdk::Symbol,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        let guardian: Option<Address> = env.storage().instance().get(&GUARDIAN_KEY);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
+            return Err(Error::Unauthorized);
+        }
+        let key = Self::flag_storage_key(&flag)?;
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&key, &now);
+        env.events().publish(
+            (symbol_short!("pause"), symbol_short!("paused")),
+            (flag, now),
+        );
+        Ok(())
+    }
+
+    /// Unpause a specific operation flag. Admin only.
+    /// Unpausing "release" or "dispute" flags requires the timelock to have elapsed
+    /// (flag must have been paused for at least UPGRADE_TIMELOCK_SECS).
+    /// This asymmetry is deliberate: stopping is instant, resuming is deliberate.
+    pub fn unpause_flag(
+        env: Env,
+        admin: Address,
+        flag: soroban_sdk::Symbol,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let key = Self::flag_storage_key(&flag)?;
+        // Funds-critical flags require timelock before unpausing.
+        let is_funds_critical =
+            flag == symbol_short!("release") || flag == symbol_short!("dispute");
+        if is_funds_critical {
+            if let Some(paused_at) = env.storage().instance().get::<_, u64>(&key) {
+                let now = env.ledger().timestamp();
+                if now < paused_at + UPGRADE_TIMELOCK_SECS {
+                    return Err(Error::TimelockNotElapsed);
+                }
+            }
+        }
+        env.storage().instance().remove(&key);
+        env.events().publish(
+            (symbol_short!("pause"), symbol_short!("unpaused")),
+            flag,
+        );
+        Ok(())
+    }
+
+    /// Returns whether a specific flag is currently paused (within safety window).
+    pub fn is_flag_paused(env: Env, flag: soroban_sdk::Symbol) -> bool {
+        let key = match Self::flag_storage_key(&flag) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        Self::flag_is_paused_now(&env, &key)
+    }
+
+    /// Map flag Symbol to its storage key.
+    fn flag_storage_key(flag: &soroban_sdk::Symbol) -> Result<soroban_sdk::Symbol, Error> {
+        if *flag == symbol_short!("lock") {
+            Ok(PAUSE_LOCK)
+        } else if *flag == symbol_short!("release") {
+            Ok(PAUSE_RELEASE)
+        } else if *flag == symbol_short!("dispute") {
+            Ok(PAUSE_DISPUTE)
+        } else {
+            Err(Error::UnknownPauseFlag)
+        }
+    }
+
+    /// Returns true if the flag is paused AND within the MAX_PAUSE_SECS safety window.
+    /// After MAX_PAUSE_SECS the flag auto-enables so users can always exit even if
+    /// admin keys are lost.
+    fn flag_is_paused_now(env: &Env, key: &soroban_sdk::Symbol) -> bool {
+        match env.storage().instance().get::<_, u64>(key) {
+            None => false,
+            Some(paused_at) => {
+                let now = env.ledger().timestamp();
+                now < paused_at + MAX_PAUSE_SECS
+            }
+        }
+    }
+
+    fn require_lock_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::flag_is_paused_now(env, &PAUSE_LOCK) {
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    fn require_release_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::flag_is_paused_now(env, &PAUSE_RELEASE) {
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    fn require_dispute_not_paused(env: &Env) -> Result<(), Error> {
+        if Self::flag_is_paused_now(env, &PAUSE_DISPUTE) {
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Legacy single-flag pause — pauses the "lock" flag only.
+    /// Refunds and disputes remain callable. Admin or Guardian only.
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         let stored: Address = env
@@ -419,13 +689,20 @@ impl PaymentContract {
             .instance()
             .get(&ADMIN_KEY)
             .ok_or(Error::Unauthorized)?;
-        if admin != stored {
+        let guardian: Option<Address> = env.storage().instance().get(&GUARDIAN_KEY);
+        if admin != stored && guardian.as_ref() != Some(&admin) {
             return Err(Error::Unauthorized);
         }
-        env.storage().instance().set(&PAUSED_KEY, &true);
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&PAUSE_LOCK, &now);
+        env.events().publish(
+            (symbol_short!("pause"), symbol_short!("paused")),
+            (symbol_short!("lock"), now),
+        );
         Ok(())
     }
 
+    /// Legacy single-flag unpause — unpauses the "lock" flag. Admin only.
     pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         let stored: Address = env
@@ -436,19 +713,21 @@ impl PaymentContract {
         if admin != stored {
             return Err(Error::Unauthorized);
         }
-        env.storage().instance().set(&PAUSED_KEY, &false);
+        env.storage().instance().remove(&PAUSE_LOCK);
+        env.events().publish(
+            (symbol_short!("pause"), symbol_short!("unpaused")),
+            symbol_short!("lock"),
+        );
         Ok(())
     }
 
+    /// Returns true if the "lock" flag is paused (legacy compat).
     pub fn is_paused(env: Env) -> bool {
-        env.storage().instance().get(&PAUSED_KEY).unwrap_or(false)
+        Self::flag_is_paused_now(&env, &PAUSE_LOCK)
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if env.storage().instance().get(&PAUSED_KEY).unwrap_or(false) {
-            return Err(Error::ContractPaused);
-        }
-        Ok(())
+        Self::require_lock_not_paused(env)
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -461,6 +740,49 @@ impl PaymentContract {
             return Err(Error::Unauthorized);
         }
         Ok(())
+    }
+
+    /// Designate the coordinator contract allowed to call `release_escrow`,
+    /// `refund_escrow`, `record_dispute`, and `resolve_dispute` on behalf of
+    /// workflow-driven settlement. Admin only.
+    pub fn set_coordinator(env: Env, admin: Address, coordinator: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&COORDINATOR_KEY, &coordinator);
+        env.events()
+            .publish((symbol_short!("coord"), symbol_short!("set")), coordinator);
+        Ok(())
+    }
+
+    /// The currently wired coordinator contract, if any.
+    pub fn get_coordinator(env: Env) -> Option<Address> {
+        env.storage().instance().get(&COORDINATOR_KEY)
+    }
+
+    /// Caller must be either the admin or the wired coordinator contract.
+    fn require_admin_or_coordinator(env: &Env, caller: &Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        if *caller == admin {
+            return Ok(());
+        }
+        let coordinator: Option<Address> = env.storage().instance().get(&COORDINATOR_KEY);
+        if coordinator.as_ref() == Some(caller) {
+            return Ok(());
+        }
+        Err(Error::Unauthorized)
+    }
+
+    /// Caller must be the payment's payer, its payee, the admin, or the
+    /// wired coordinator (e.g. an automated temperature-breach report).
+    fn require_dispute_recorder(env: &Env, caller: &Address, payment: &Payment) -> Result<(), Error> {
+        if *caller == payment.payer || *caller == payment.payee {
+            return Ok(());
+        }
+        Self::require_admin_or_coordinator(env, caller)
     }
 
     pub fn create_payment(
@@ -480,12 +802,11 @@ impl PaymentContract {
         payer.require_auth();
 
         // Reject if a payment for this request already exists.
-        let existing_map: Map<u64, u64> = env
+        if env
             .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        if existing_map.contains_key(request_id) {
+            .persistent()
+            .has(&request_payment_key(request_id))
+        {
             return Err(Error::DuplicatePayment);
         }
 
@@ -537,6 +858,9 @@ impl PaymentContract {
         payments: Vec<(u64, Address, Address, i128)>,
     ) -> Result<Vec<u64>, Error> {
         Self::require_not_paused(&env)?;
+        if payments.len() > MAX_BATCH_PAYMENTS {
+            return Err(Error::BatchTooLarge);
+        }
         let mut ids: Vec<u64> = Vec::new(&env);
         for i in 0..payments.len() {
             let (request_id, payer, payee, amount) = payments.get(i).unwrap();
@@ -566,12 +890,11 @@ impl PaymentContract {
         hospital.require_auth();
 
         // Reject if a payment for this request already exists.
-        let existing_map: Map<u64, u64> = env
+        if env
             .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        if existing_map.contains_key(request_id) {
+            .persistent()
+            .has(&request_payment_key(request_id))
+        {
             return Err(Error::DuplicatePayment);
         }
 
@@ -630,13 +953,34 @@ impl PaymentContract {
     /// the payment as Released.
     pub fn release_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
+        Self::require_release_not_paused(&env)?;
+        Self::require_admin_or_coordinator(&env, &caller)?;
 
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
 
         if payment.status != PaymentStatus::Locked {
             return Err(Error::PaymentNotLocked);
+        }
+
+        // Gate: payee must hold a valid BloodBankAccreditation at settlement time.
+        if let Some(identity_addr) = env
+            .storage()
+            .instance()
+            .get::<soroban_sdk::Symbol, Address>(&IDENTITY_CONTRACT)
+        {
+            let id_client = IdentityContractClient::new(&env, &identity_addr);
+            // Request grace for an in-flight workflow; identity policy decides.
+            let credentialed = id_client
+                .try_is_valid(
+                    &payment.payee,
+                    &CredentialType::BloodBankAccreditation,
+                    &true,
+                )
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+            if !credentialed {
+                return Err(Error::Unauthorized);
+            }
         }
 
         let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
@@ -666,10 +1010,14 @@ impl PaymentContract {
     /// Refund escrowed funds to the payer. Admin only.
     /// Transfers the locked amount from the contract back to the payer and
     /// marks the payment as Refunded.
+    /// NOTE: refund is intentionally NOT gated by the lock flag — users must
+    /// always be able to exit even when new escrows are paused.
     pub fn refund_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         caller.require_auth();
-        Self::require_not_paused(&env)?;
-        Self::require_admin(&env, &caller)?;
+        // Refund path is only blocked by the release flag (funds-critical),
+        // and only while within the MAX_PAUSE_SECS safety window.
+        Self::require_release_not_paused(&env)?;
+        Self::require_admin_or_coordinator(&env, &caller)?;
 
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
 
@@ -701,27 +1049,22 @@ impl PaymentContract {
         Ok(())
     }
 
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) -> Result<(), Error> {
-        Self::require_not_paused(&env)?;
-        let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
-        let old_status = payment.status;
-        payment.status = status;
-        payment.updated_at = env.ledger().timestamp();
-        store_payment(&env, &payment);
-        remove_from_status_index(&env, old_status, payment_id);
-        index_by_status(&env, status, payment_id);
-        update_stats_on_transition(&env, payment.amount, old_status, status);
-        Ok(())
-    }
-
     pub fn record_dispute(
         env: Env,
+        caller: Address,
         payment_id: u64,
         reason: DisputeReason,
         case_id: String,
     ) -> Result<(), Error> {
-        Self::require_not_paused(&env)?;
+        caller.require_auth();
+        // Dispute path is gated by its own flag, NOT the lock flag.
+        // Users must always be able to raise a dispute on locked funds.
+        Self::require_dispute_not_paused(&env)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
+        if payment.status != PaymentStatus::Locked {
+            return Err(Error::PaymentNotLocked);
+        }
+        Self::require_dispute_recorder(&env, &caller, &payment)?;
         let old_status = payment.status;
         payment.status = PaymentStatus::Disputed;
         payment.dispute_reason_code = Some(dispute_reason_to_code(reason));
@@ -743,14 +1086,21 @@ impl PaymentContract {
         Ok(())
     }
 
-    pub fn resolve_dispute(env: Env, payment_id: u64) -> Result<(), Error> {
-        Self::require_not_paused(&env)?;
+    pub fn resolve_dispute(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_dispute_not_paused(&env)?;
+        Self::require_admin_or_coordinator(&env, &caller)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
-        if payment.dispute_case_id.is_some() {
-            payment.dispute_resolved = true;
+        if payment.status != PaymentStatus::Disputed {
+            return Err(Error::PaymentNotDisputed);
         }
+        payment.dispute_resolved = true;
+        payment.status = PaymentStatus::Locked;
         payment.updated_at = env.ledger().timestamp();
         store_payment(&env, &payment);
+        remove_from_status_index(&env, PaymentStatus::Disputed, payment_id);
+        index_by_status(&env, PaymentStatus::Locked, payment_id);
+        update_stats_on_transition(&env, payment.amount, PaymentStatus::Disputed, PaymentStatus::Locked);
         env.events().publish(
             (
                 symbol_short!("payment"),
@@ -769,12 +1119,11 @@ impl PaymentContract {
     }
 
     pub fn get_payment_by_request(env: Env, request_id: u64) -> Result<Payment, Error> {
-        let map: Map<u64, u64> = env
+        let payment_id: u64 = env
             .storage()
-            .instance()
-            .get(&REQ_IDX)
-            .unwrap_or(Map::new(&env));
-        let payment_id = map.get(request_id).ok_or(Error::PaymentNotFound)?;
+            .persistent()
+            .get(&request_payment_key(request_id))
+            .ok_or(Error::PaymentNotFound)?;
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
@@ -784,13 +1133,21 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
+        let page_size = normalized_page_size(page_size);
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&payer_index_count_key(&payer))
+            .unwrap_or(0);
+        let start = (page as u64) * (page_size as u64);
+        let index_page = (start / INDEX_PAGE_SIZE as u64) as u32;
+        let offset = (start % INDEX_PAGE_SIZE as u64) as u32;
         let ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&payer_index_key(&payer))
+            .get(&payer_index_page_key(&payer, index_page))
             .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        Self::load_page(&env, ids, total as u64, offset, page, page_size)
     }
 
     pub fn get_payments_by_payee(
@@ -799,13 +1156,21 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
+        let page_size = normalized_page_size(page_size);
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&payee_index_count_key(&payee))
+            .unwrap_or(0);
+        let start = (page as u64) * (page_size as u64);
+        let index_page = (start / INDEX_PAGE_SIZE as u64) as u32;
+        let offset = (start % INDEX_PAGE_SIZE as u64) as u32;
         let ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&payee_index_key(&payee))
+            .get(&payee_index_page_key(&payee, index_page))
             .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        Self::load_page(&env, ids, total as u64, offset, page, page_size)
     }
 
     pub fn get_payments_by_status(
@@ -814,13 +1179,21 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
+        let page_size = normalized_page_size(page_size);
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&status_index_count_key(status))
+            .unwrap_or(0);
+        let start = (page as u64) * (page_size as u64);
+        let index_page = (start / INDEX_PAGE_SIZE as u64) as u32;
+        let offset = (start % INDEX_PAGE_SIZE as u64) as u32;
         let ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&status_index_key(status))
+            .get(&status_index_page_key(status, index_page))
             .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        Self::load_page(&env, ids, total as u64, offset, page, page_size)
     }
 
     pub fn get_payment_statistics(env: Env) -> PaymentStats {
@@ -828,34 +1201,16 @@ impl PaymentContract {
     }
 
     pub fn get_payment_timeline(env: Env, page: u32, page_size: u32) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
+        let page_size = normalized_page_size(page_size);
         let total = get_counter(&env);
-
-        let mut all: Vec<Payment> = Vec::new(&env);
-        for id in 1..=total {
-            if let Some(p) = load_payment(&env, id) {
-                all.push_back(p);
-            }
-        }
-
-        let len = all.len();
-        for i in 0..len {
-            for j in 0..len.saturating_sub(i + 1) {
-                let current = all.get(j).unwrap();
-                let next = all.get(j + 1).unwrap();
-                if current.created_at > next.created_at {
-                    all.set(j, next);
-                    all.set(j + 1, current);
-                }
-            }
-        }
-
         let start = (page as u64) * (page_size as u64);
         let end = (start + page_size as u64).min(total);
         let mut items: Vec<Payment> = Vec::new(&env);
         if start < total {
             for i in start..end {
-                items.push_back(all.get(i as u32).unwrap());
+                if let Some(payment) = load_payment(&env, i + 1) {
+                    items.push_back(payment);
+                }
             }
         }
 
@@ -1124,18 +1479,20 @@ impl PaymentContract {
 
     // ── Internal helpers ───────────────────────────────────────────────────────
 
-    fn load_page(env: &Env, ids: Vec<u64>, page: u32, page_size: u32) -> PaymentPage {
-        let total = ids.len() as u64;
-        let start = (page as u64) * (page_size as u64);
+    fn load_page(
+        env: &Env,
+        ids: Vec<u64>,
+        total: u64,
+        offset: u32,
+        page: u32,
+        page_size: u32,
+    ) -> PaymentPage {
         let mut items: Vec<Payment> = Vec::new(env);
 
-        if start < total {
-            let end = (start + page_size as u64).min(total);
-            for i in start..end {
-                let id = ids.get(i as u32).unwrap();
-                if let Some(p) = load_payment(env, id) {
-                    items.push_back(p);
-                }
+        for i in offset..ids.len().min(offset + page_size) {
+            let id = ids.get(i).unwrap();
+            if let Some(p) = load_payment(env, id) {
+                items.push_back(p);
             }
         }
 

@@ -57,6 +57,7 @@ pub enum DataKey {
     Admin,
     InventoryContract,
     RequestsContract,
+    IdentityContract,
     Initialized,
     Paused,
 }
