@@ -14,20 +14,18 @@ pub use crate::types::{
     RequestStatus, Urgency,
 };
 
+// Re-export the shared cross-contract types so downstream callers see the
+// single definition from the `interfaces` crate rather than a local mirror.
+pub use interfaces::types::{
+    BloodComponent as SharedBloodComponent, BloodRequest as SharedBloodRequest,
+    BloodType as SharedBloodType, RequestStatus as SharedRequestStatus, Urgency as SharedUrgency,
+};
+
 mod validation;
 
 use soroban_sdk::{contract, contractimpl, Address, Env};
 
-mod inventory_client {
-    use soroban_sdk::{contractclient, Env};
-
-    #[contractclient(name = "InventoryContractClient")]
-    pub trait InventoryContractInterface {
-        fn release_reservation(env: Env, reservation_id: u64);
-    }
-}
-
-use inventory_client::InventoryContractClient;
+use interfaces::clients::InventoryContractClient;
 
 #[contract]
 pub struct RequestContract;

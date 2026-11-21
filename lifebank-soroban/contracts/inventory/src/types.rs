@@ -1,58 +1,9 @@
 use crate::error::ContractError;
 use soroban_sdk::{contracttype, Address, Map, String, Symbol, Vec};
 
-/// Blood type enumeration supporting all major blood groups
-///
-/// Each variant represents a unique combination of ABO and Rh blood typing:
-/// - A+, A-: Type A with positive/negative Rh factor
-/// - B+, B-: Type B with positive/negative Rh factor  
-/// - AB+, AB-: Type AB with positive/negative Rh factor
-/// - O+, O-: Type O with positive/negative Rh factor
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum BloodType {
-    /// Type A positive (A+)
-    APositive,
-    /// Type A negative (A-)
-    ANegative,
-    /// Type B positive (B+)
-    BPositive,
-    /// Type B negative (B-)
-    BNegative,
-    /// Type AB positive (AB+) - Universal plasma donor
-    ABPositive,
-    /// Type AB negative (AB-)
-    ABNegative,
-    /// Type O positive (O+)
-    OPositive,
-    /// Type O negative (O-) - Universal blood donor
-    ONegative,
-}
-
-/// Blood unit status representing its current state in the supply chain
-///
-/// Status transitions follow this flow:
-/// Available -> Reserved -> InTransit -> Delivered
-///           \-> Expired (can happen at any stage)
-///           \-> Compromised (temperature violations trigger this)
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum BloodStatus {
-    /// Available for reservation - initial state after donation processing
-    Available,
-    /// Reserved for a specific request but not yet shipped
-    Reserved,
-    /// Currently being transported to destination
-    InTransit,
-    /// Successfully delivered to recipient/hospital
-    Delivered,
-    /// Expired and no longer usable (typically after 42 days for whole blood)
-    Expired,
-    /// Compromised due to 3 consecutive temperature violations - unsafe for use
-    Compromised,
-    /// Formally disposed of after expiry or compromise — permanent end-of-life
-    Disposed,
-}
+// Cross-contract types are defined once in the shared `interfaces` crate and
+// re-exported here so existing `crate::types::*` imports keep working.
+pub use interfaces::types::{BloodStatus, BloodType, Reservation};
 
 /// Complete blood unit record stored in the inventory contract
 ///
@@ -292,17 +243,6 @@ pub enum DataKey {
 
     /// Circuit breaker: contract is paused
     Paused,
-}
-
-/// Reservation record for blood units locked for a specific requester
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Reservation {
-    pub unit_ids: Vec<u64>,
-    pub requester: Address,
-    pub created_timestamp: u64,
-    pub expiration_timestamp: u64,
-    pub request_id: u64,
 }
 
 #[contracttype]

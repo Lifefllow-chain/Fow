@@ -12,10 +12,11 @@ use soroban_sdk::{
     vec, Address, Env, String, Vec,
 };
 
-use super::{
-    BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract, CoordinatorContractClient,
-    CoordinatorError, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
+use interfaces::{
+    BloodRequest, BloodStatus, BloodType, BloodUnit, Payment, PaymentStatus, RequestStatus,
 };
+
+use super::{CoordinatorContract, CoordinatorContractClient, CoordinatorError, WorkflowStatus};
 
 // ── Mock: Request contract ────────────────────────────────────────────────────
 
@@ -186,7 +187,7 @@ impl MockInventoryContract {
         env.storage().instance().set(&InvKey::ReservationCounter, &id);
 
         let now = env.ledger().timestamp();
-        let reservation = super::Reservation {
+        let reservation = interfaces::Reservation {
             unit_ids: unit_ids.clone(),
             requester,
             created_timestamp: now,
@@ -221,7 +222,7 @@ impl MockInventoryContract {
             panic!("forced release_reservation failure");
         }
 
-        let reservation: super::Reservation = env
+        let reservation: interfaces::Reservation = env
             .storage()
             .persistent()
             .get(&InvKey::Reservation(reservation_id))
@@ -245,7 +246,7 @@ impl MockInventoryContract {
             .remove(&InvKey::Reservation(reservation_id));
     }
 
-    pub fn get_reservation(env: Env, reservation_id: u64) -> super::Reservation {
+    pub fn get_reservation(env: Env, reservation_id: u64) -> interfaces::Reservation {
         env.storage()
             .persistent()
             .get(&InvKey::Reservation(reservation_id))
@@ -257,8 +258,8 @@ impl MockInventoryContract {
         reservation_id: u64,
         additional_seconds: u64,
         _authorized_by: Address,
-    ) -> super::Reservation {
-        let mut reservation: super::Reservation = env
+    ) -> interfaces::Reservation {
+        let mut reservation: interfaces::Reservation = env
             .storage()
             .persistent()
             .get(&InvKey::Reservation(reservation_id))
@@ -425,7 +426,7 @@ impl MockPaymentContract {
         env: Env,
         caller: Address,
         payment_id: u64,
-        _reason: super::payment_client::DisputeReason,
+        _reason: interfaces::DisputeReason,
         _case_id: String,
     ) {
         caller.require_auth();
@@ -1229,7 +1230,7 @@ fn test_deadline_extended_during_dlvr_pause() {
 
 // ── Temperature excursion → dispute integration tests (issue #477) ────────────
 
-use super::ExcursionSummary;
+use interfaces::ExcursionSummary;
 
 fn make_excursion(unit_id: u64) -> ExcursionSummary {
     ExcursionSummary {

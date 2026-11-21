@@ -1,8 +1,31 @@
 use crate::types::{BloodStatus, BloodUnit, DataKey, StatusChangeHistory};
+use interfaces::ttl::{bump, bump_instance, StorageClass};
 use soroban_sdk::{Address, Env, String, Vec};
 
 pub const SECONDS_PER_DAY: u64 = 86400;
 pub const BLOOD_SHELF_LIFE_DAYS: u64 = 35;
+
+// ── Storage classes & TTL policy ───────────────────────────────────────────────
+//
+// Every persistent key in this contract has a documented storage class and TTL
+// policy. TTL is bumped on every access (read or write) via `interfaces::ttl`.
+//
+// | Key                                   | Class    | TTL policy                          |
+// |---------------------------------------|----------|-------------------------------------|
+// | BloodUnit(id)                         | BloodUnit| Extended past product expiry        |
+// |                                       |          | (35-day shelf life) on write/read   |
+// | BloodTypeIndex(type)                  | Index    | Bumped on access                    |
+// | BankIndex(bank)                       | Index    | Bumped on access                    |
+// | StatusIndex(status)                   | Index    | Bumped on access                    |
+// | DonorIndex(donor)                     | Index    | Bumped on access                    |
+// | StatusHistory(unit_id)                | Index    | Bumped on access                    |
+// | StatusHistoryPage(unit_id, page)      | Index    | Bumped on access                    |
+// | BloodUnitStatusChangeCount(unit_id)   | Counter  | Bumped on access                    |
+// | Reservation(id) (temporary)           | Counter  | Bumped on access                    |
+//
+// Instance storage (Admin, BloodUnitCounter, StatusHistoryCounter,
+// ReservationCounter) is extended at entrypoint level via `bump_instance`.
+// ───────────────────────────────────────────────────────────────────────────────
 
 /// Maximum history entries per storage page. Keeps each page small so
 /// a single read never loads the entire history of a high-traffic unit.
@@ -40,15 +63,28 @@ pub fn increment_blood_unit_id(env: &Env) -> u64 {
 // ── Blood unit CRUD ────────────────────────────────────────────────────────────
 
 pub fn set_blood_unit(env: &Env, blood_unit: &BloodUnit) {
-    env.storage().persistent().set(&DataKey::BloodUnit(blood_unit.id), blood_unit);
+    let key = DataKey::BloodUnit(blood_unit.id);
+    env.storage().persistent().set(&key, blood_unit);
+    // Extend the unit's TTL past its product expiry (shelf life).
+    bump(env, &key, StorageClass::BloodUnit);
 }
 
 pub fn get_blood_unit(env: &Env, id: u64) -> Option<BloodUnit> {
-    env.storage().persistent().get(&DataKey::BloodUnit(id))
+    let key = DataKey::BloodUnit(id);
+    let unit = env.storage().persistent().get(&key);
+    if unit.is_some() {
+        bump(env, &key, StorageClass::BloodUnit);
+    }
+    unit
 }
 
 pub fn blood_unit_exists(env: &Env, id: u64) -> bool {
-    env.storage().persistent().has(&DataKey::BloodUnit(id))
+    let key = DataKey::BloodUnit(id);
+    let exists = env.storage().persistent().has(&key);
+    if exists {
+        bump(env, &key, StorageClass::BloodUnit);
+    }
+    exists
 }
 
 // ── Indexes ────────────────────────────────────────────────────────────────────
@@ -58,6 +94,7 @@ pub fn add_to_blood_type_index(env: &Env, blood_unit: &BloodUnit) {
     let mut units: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
     units.push_back(blood_unit.id);
     env.storage().persistent().set(&key, &units);
+    bump(env, &key, StorageClass::Index);
 }
 
 pub fn add_to_bank_index(env: &Env, blood_unit: &BloodUnit) {
@@ -65,6 +102,7 @@ pub fn add_to_bank_index(env: &Env, blood_unit: &BloodUnit) {
     let mut units: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
     units.push_back(blood_unit.id);
     env.storage().persistent().set(&key, &units);
+    bump(env, &key, StorageClass::Index);
 }
 
 pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
@@ -72,6 +110,7 @@ pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
     let mut units: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
     units.push_back(blood_unit.id);
     env.storage().persistent().set(&key, &units);
+    bump(env, &key, StorageClass::Index);
 }
 
 /// Remove a single ID from a status index bucket.
@@ -87,6 +126,7 @@ pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: Blood
         }
     }
     env.storage().persistent().set(&key, &updated);
+    bump(env, &key, StorageClass::Index);
 }
 
 pub fn add_to_donor_index(env: &Env, blood_unit: &BloodUnit) {
@@ -95,6 +135,7 @@ pub fn add_to_donor_index(env: &Env, blood_unit: &BloodUnit) {
         let mut units: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
         units.push_back(blood_unit.id);
         env.storage().persistent().set(&key, &units);
+        bump(env, &key, StorageClass::Index);
     }
 }
 
@@ -133,6 +174,7 @@ pub fn record_status_change(
     // Determine which page to append to
     let page_key = DataKey::StatusHistory(blood_unit_id); // stores current page number
     let current_page: u32 = env.storage().persistent().get(&page_key).unwrap_or(0);
+    bump(env, &page_key, StorageClass::Index);
 
     let page_data_key = DataKey::StatusHistoryPage(blood_unit_id, current_page);
     let mut page: Vec<StatusChangeHistory> = env
@@ -145,19 +187,23 @@ pub fn record_status_change(
         // Current page is full — start a new one
         let next_page = current_page + 1;
         env.storage().persistent().set(&page_key, &next_page);
+        bump(env, &page_key, StorageClass::Index);
         let new_page_key = DataKey::StatusHistoryPage(blood_unit_id, next_page);
         let mut new_page: Vec<StatusChangeHistory> = Vec::new(env);
         new_page.push_back(entry);
         env.storage().persistent().set(&new_page_key, &new_page);
+        bump(env, &new_page_key, StorageClass::Index);
     } else {
         page.push_back(entry);
         env.storage().persistent().set(&page_data_key, &page);
+        bump(env, &page_data_key, StorageClass::Index);
     }
 
     // Increment change count
     let count_key = DataKey::BloodUnitStatusChangeCount(blood_unit_id);
     let count = get_blood_unit_status_change_count(env, blood_unit_id);
     env.storage().persistent().set(&count_key, &(count + 1));
+    bump(env, &count_key, StorageClass::Counter);
 }
 
 /// Return all history entries for a unit by iterating pages.
@@ -165,6 +211,7 @@ pub fn record_status_change(
 pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHistory> {
     let page_key = DataKey::StatusHistory(blood_unit_id);
     let last_page: u32 = env.storage().persistent().get(&page_key).unwrap_or(0);
+    bump(env, &page_key, StorageClass::Index);
 
     let mut all: Vec<StatusChangeHistory> = Vec::new(env);
     for p in 0..=last_page {
@@ -174,6 +221,7 @@ pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHist
             .persistent()
             .get(&page_data_key)
             .unwrap_or(Vec::new(env));
+        bump(env, &page_data_key, StorageClass::Index);
         for i in 0..page.len() {
             all.push_back(page.get(i).unwrap());
         }
@@ -188,23 +236,28 @@ pub fn get_status_history_page(
     page: u32,
 ) -> Vec<StatusChangeHistory> {
     let page_data_key = DataKey::StatusHistoryPage(blood_unit_id, page);
-    env.storage()
+    let result = env
+        .storage()
         .persistent()
         .get(&page_data_key)
-        .unwrap_or(Vec::new(env))
+        .unwrap_or(Vec::new(env));
+    bump(env, &page_data_key, StorageClass::Index);
+    result
 }
 
 /// Return the current (last) page number for a unit's history.
 pub fn get_history_page_count(env: &Env, blood_unit_id: u64) -> u32 {
     let page_key = DataKey::StatusHistory(blood_unit_id);
-    env.storage().persistent().get(&page_key).unwrap_or(0)
+    let count = env.storage().persistent().get(&page_key).unwrap_or(0);
+    bump(env, &page_key, StorageClass::Index);
+    count
 }
 
 pub fn get_blood_unit_status_change_count(env: &Env, blood_unit_id: u64) -> u64 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::BloodUnitStatusChangeCount(blood_unit_id))
-        .unwrap_or(0)
+    let key = DataKey::BloodUnitStatusChangeCount(blood_unit_id);
+    let count = env.storage().persistent().get(&key).unwrap_or(0);
+    bump(env, &key, StorageClass::Counter);
+    count
 }
 
 fn increment_status_history_counter(env: &Env) -> u64 {
@@ -226,11 +279,18 @@ pub fn increment_reservation_id(env: &Env) -> u64 {
 }
 
 pub fn set_reservation(env: &Env, id: u64, reservation: &crate::types::Reservation) {
-    env.storage().temporary().set(&DataKey::Reservation(id), reservation);
+    let key = DataKey::Reservation(id);
+    env.storage().temporary().set(&key, reservation);
+    bump(env, &key, StorageClass::Counter);
 }
 
 pub fn get_reservation(env: &Env, id: u64) -> Option<crate::types::Reservation> {
-    env.storage().temporary().get(&DataKey::Reservation(id))
+    let key = DataKey::Reservation(id);
+    let reservation = env.storage().temporary().get(&key);
+    if reservation.is_some() {
+        bump(env, &key, StorageClass::Counter);
+    }
+    reservation
 }
 
 pub fn remove_reservation(env: &Env, id: u64) {

@@ -1,3 +1,8 @@
+import {
+  CONTRACT_EVENT_TOPICS,
+  type ContractEventTopic,
+} from '../__contracts__/generated';
+
 export const CONTRACT_EVENT_SCHEMA_VERSION = 1;
 export const LEGACY_CONTRACT_EVENT_SCHEMA_VERSION = 0;
 
@@ -80,30 +85,26 @@ export interface ContractEventSchemaEntry {
 
 /**
  * Known contract event topics and the schema versions the indexer supports.
- * Adding a new event type or version here is the single place that opts the
- * indexer into processing it — anything else is quarantined.
+ *
+ * Event names and required payload fields are derived from the generated
+ * contract spec types (`backend/src/__contracts__/generated.ts`), which are
+ * produced from the committed contract spec snapshots. This keeps the
+ * registry from drifting from the contracts: a new/renamed event or a changed
+ * required field only reaches the indexer via a regenerated spec.
  */
 export const CONTRACT_EVENT_SCHEMA_REGISTRY: Readonly<
   Record<string, ContractEventSchemaEntry>
-> = {
-  blood_registered: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  custody_transferred: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  temperature_logged: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  hash_anchored: { versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS },
-  blood_quarantined: { versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS },
-  blood_quarantine_finalized: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-  },
-};
+> = Object.fromEntries(
+  CONTRACT_EVENT_TOPICS.map((topic: ContractEventTopic) => [
+    topic.name,
+    {
+      versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
+      ...(topic.requiredFields.length > 0
+        ? { requiredFields: topic.requiredFields }
+        : {}),
+    } satisfies ContractEventSchemaEntry,
+  ]),
+);
 
 export type ContractEventDecodeResult =
   | {
