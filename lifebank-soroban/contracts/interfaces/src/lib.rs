@@ -10,6 +10,11 @@
 //! Payload structs are append-only: add fields, never remove/rename/retype one
 //! in place. A breaking change to an existing event gets a new struct and the
 //! emitter bumps `schema_version` for that event name.
+//!
+//! The `ttl` module holds the workspace-wide storage TTL policy shared by the
+//! `payments` and `inventory` contracts: per-storage-class threshold/extend-to
+//! targets and the `bump` / `bump_to_deadline` helpers.
 
 pub mod envelope;
 pub mod events;
+pub mod ttl;
